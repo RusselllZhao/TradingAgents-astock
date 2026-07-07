@@ -930,32 +930,221 @@ def _get_financial_report_sina(
     return df.head(8)
 
 
+def _tushare_ts_code(code: str) -> str:
+    """Pure 6-digit A-share code -> Tushare ts_code."""
+    if code.startswith(("6", "9")):
+        return f"{code}.SH"
+    if code.startswith("8"):
+        return f"{code}.BJ"
+    return f"{code}.SZ"
+
+
+def _tushare_data_to_frame(data: object) -> pd.DataFrame:
+    """Convert a Tushare Pro data payload into a DataFrame."""
+    if not isinstance(data, dict):
+        return pd.DataFrame()
+    fields = data.get("fields")
+    items = data.get("items")
+    if not isinstance(fields, list) or not isinstance(items, list):
+        return pd.DataFrame()
+    return pd.DataFrame(items, columns=fields)
+
+
+_FINANCIAL_COMMON_FIELDS = [
+    "ts_code",
+    "ann_date",
+    "f_ann_date",
+    "end_date",
+    "report_type",
+    "comp_type",
+    "end_type",
+]
+
+_FINANCIAL_CORE_FIELDS = {
+    "balancesheet": [
+        "total_share",
+        "money_cap",
+        "accounts_receiv",
+        "inventories",
+        "total_assets",
+        "total_liab",
+        "total_hldr_eqy_exc_min_int",
+    ],
+    "cashflow": [
+        "net_profit",
+        "c_fr_sale_sg",
+        "n_cashflow_act",
+        "n_cashflow_inv_act",
+        "n_cash_flows_fnc_act",
+        "c_cash_equ_end_period",
+    ],
+    "income": [
+        "basic_eps",
+        "total_revenue",
+        "revenue",
+        "oper_profit",
+        "total_profit",
+        "n_income",
+        "n_income_attr_p",
+    ],
+}
+
+
+def _financial_statement_fields(api_name: str) -> str:
+    fields = _FINANCIAL_COMMON_FIELDS + _FINANCIAL_CORE_FIELDS.get(api_name, [])
+    return ",".join(dict.fromkeys(fields))
+
+
+def _short_tushare_statement_error(
+    title: str,
+    code: str,
+    ts_code: str,
+    freq: str,
+    curr_date: str,
+    api_name: str,
+    status: str,
+    reason: str,
+) -> str:
+    header = f"# {title} for {code} (A-stock, {freq})\n"
+    header += "# Data source: Tushare\n"
+    header += f"# API: {api_name}\n"
+    header += f"# status: {status}\n"
+    header += "# as_of_field: ann_date\n"
+    header += "# period_field: end_date\n"
+    header += "# statement_scope: consolidated_only\n"
+    header += "# report_type_filter: unverified\n"
+    header += "# quarterly_policy: cumulative_period\n"
+    header += f"# as_of: {curr_date}\n"
+    header += f"# ts_code: {ts_code}\n\n"
+    return header + f"{status}: {reason}"
+
+
+def _get_financial_statement_tushare(
+    code: str,
+    api_name: str,
+    title: str,
+    freq: str,
+    curr_date: str = None,
+) -> str:
+    from .tushare_client import get_tushare_client
+
+    normalized_freq = (freq or "quarterly").lower()
+    as_of = curr_date or datetime.now().strftime("%Y-%m-%d")
+    as_of_compact = as_of.replace("-", "")
+    ts_code = _tushare_ts_code(code)
+    fields = _financial_statement_fields(api_name)
+
+    response = get_tushare_client().call_api(
+        api_name,
+        params={"ts_code": ts_code},
+        fields=fields,
+        cache_key=f"{api_name}/{ts_code}/latest.json",
+    )
+
+    if not response.ok:
+        return _short_tushare_statement_error(
+            title,
+            code,
+            ts_code,
+            normalized_freq,
+            as_of,
+            api_name,
+            "technical_error",
+            response.error or "tushare_upstream_error",
+        )
+
+    try:
+        df = _tushare_data_to_frame(response.data)
+        if df.empty:
+            return _short_tushare_statement_error(
+                title,
+                code,
+                ts_code,
+                normalized_freq,
+                as_of,
+                api_name,
+                "no_data",
+                "no_statement_before_as_of",
+            )
+
+        for column in ("ann_date", "f_ann_date", "end_date"):
+            if column in df.columns:
+                df[column] = df[column].astype(str).str.replace("-", "", regex=False)
+
+        if "ann_date" in df.columns:
+            df = df[df["ann_date"].str.len().eq(8)]
+            df = df[df["ann_date"] <= as_of_compact]
+        if "end_date" in df.columns:
+            df = df[df["end_date"].str.len().eq(8)]
+            if normalized_freq == "annual":
+                df = df[df["end_date"].str.endswith("1231")]
+            else:
+                df = df[df["end_date"].str[-4:].isin(["0331", "0630", "0930", "1231"])]
+
+        if df.empty:
+            return _short_tushare_statement_error(
+                title,
+                code,
+                ts_code,
+                normalized_freq,
+                as_of,
+                api_name,
+                "no_data",
+                "no_statement_before_as_of",
+            )
+
+        sort_cols = [col for col in ("ann_date", "end_date") if col in df.columns]
+        if sort_cols:
+            df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+        df = df.head(8).reset_index(drop=True)
+
+        preferred = _FINANCIAL_COMMON_FIELDS + _FINANCIAL_CORE_FIELDS.get(api_name, [])
+        ordered_cols = [col for col in preferred if col in df.columns]
+        remaining_cols = [col for col in df.columns if col not in ordered_cols]
+        csv_string = df[ordered_cols + remaining_cols].to_csv(index=False)
+
+    except Exception:
+        return _short_tushare_statement_error(
+            title,
+            code,
+            ts_code,
+            normalized_freq,
+            as_of,
+            api_name,
+            "technical_error",
+            "parse_error",
+        )
+
+    header = f"# {title} for {code} (A-stock, {normalized_freq})\n"
+    header += "# Data source: Tushare\n"
+    header += f"# API: {api_name}\n"
+    header += "# status: ok\n"
+    header += "# as_of_field: ann_date\n"
+    header += "# period_field: end_date\n"
+    header += "# statement_scope: consolidated_only\n"
+    header += "# report_type_filter: unverified\n"
+    header += "# quarterly_policy: cumulative_period\n"
+    header += f"# as_of: {as_of}\n"
+    header += f"# ts_code: {ts_code}\n"
+    header += f"# rows: {len(df)}\n"
+    header += f"# cache_hit: {str(response.cache_hit).lower()}\n"
+    header += (
+        f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    )
+
+    return header + csv_string
+
+
 def get_balance_sheet(
     ticker: Annotated[str, "A-stock code"],
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Get balance sheet via Sina direct HTTP API."""
+    """Get balance sheet via Tushare Pro balancesheet."""
     code = _normalize_ticker(ticker)
-
-    try:
-        df = _get_financial_report_sina(code, "资产负债表", freq, curr_date)
-
-        if df.empty:
-            return f"No balance sheet data found for A-stock '{code}'"
-
-        csv_string = df.to_csv(index=False)
-
-        header = f"# Balance Sheet for {code} (A-stock, {freq})\n"
-        header += "# Data source: sina direct HTTP\n"
-        header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        )
-
-        return header + csv_string
-
-    except Exception as e:
-        return f"Error retrieving balance sheet for {code}: {str(e)}"
+    return _get_financial_statement_tushare(
+        code, "balancesheet", "Balance Sheet", freq, curr_date
+    )
 
 
 # ---- 5. get_cashflow ----
@@ -966,27 +1155,11 @@ def get_cashflow(
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Get cash flow statement via Sina direct HTTP API."""
+    """Get cash flow statement via Tushare Pro cashflow."""
     code = _normalize_ticker(ticker)
-
-    try:
-        df = _get_financial_report_sina(code, "现金流量表", freq, curr_date)
-
-        if df.empty:
-            return f"No cash flow data found for A-stock '{code}'"
-
-        csv_string = df.to_csv(index=False)
-
-        header = f"# Cash Flow for {code} (A-stock, {freq})\n"
-        header += "# Data source: sina direct HTTP\n"
-        header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        )
-
-        return header + csv_string
-
-    except Exception as e:
-        return f"Error retrieving cash flow for {code}: {str(e)}"
+    return _get_financial_statement_tushare(
+        code, "cashflow", "Cash Flow", freq, curr_date
+    )
 
 
 # ---- 6. get_income_statement ----
@@ -997,27 +1170,11 @@ def get_income_statement(
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Get income statement via Sina direct HTTP API."""
+    """Get income statement via Tushare Pro income."""
     code = _normalize_ticker(ticker)
-
-    try:
-        df = _get_financial_report_sina(code, "利润表", freq, curr_date)
-
-        if df.empty:
-            return f"No income statement data found for A-stock '{code}'"
-
-        csv_string = df.to_csv(index=False)
-
-        header = f"# Income Statement for {code} (A-stock, {freq})\n"
-        header += "# Data source: sina direct HTTP\n"
-        header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        )
-
-        return header + csv_string
-
-    except Exception as e:
-        return f"Error retrieving income statement for {code}: {str(e)}"
+    return _get_financial_statement_tushare(
+        code, "income", "Income Statement", freq, curr_date
+    )
 
 
 # ---- 7. get_news ----
