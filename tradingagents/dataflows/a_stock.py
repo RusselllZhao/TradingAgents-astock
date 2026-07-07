@@ -1510,95 +1510,256 @@ def get_insider_transactions(
 
 # ---- 10. get_profit_forecast ----
 
+_REPORT_RC_FIELDS = [
+    "ts_code",
+    "report_date",
+    "quarter",
+    "org_name",
+    "author_name",
+    "eps",
+    "np",
+    "op_rt",
+    "rating",
+]
+
+
+def _profit_forecast_error_header(
+    code: str,
+    ts_code: str,
+    as_of: str,
+    status: str,
+    reason: str,
+    stale_forecast_window: bool = False,
+) -> str:
+    header = f"# Consensus EPS Forecast for {code} (A-stock)\n"
+    header += "# Source: Tushare report_rc sell-side forecast aggregation\n"
+    header += f"# status: {status}\n"
+    header += "# api=report_rc\n"
+    header += "# forecast_type=sell_side_forecast\n"
+    header += "# not_company_guidance=true\n"
+    header += f"# as_of: {as_of}\n"
+    header += "# as_of_field=report_date\n"
+    header += "# report_date_range: N/A\n"
+    header += "# source_count: 0\n"
+    header += "# source_org_count: 0\n"
+    header += "# low_coverage=true\n"
+    header += f"# stale_forecast_window={str(stale_forecast_window).lower()}\n"
+    header += f"# ts_code: {ts_code}\n"
+    header += f"# empty_reason: {reason}\n"
+    header += "# note: sell-side forecast aggregation; not company guidance, earnings preview, earnings flash, or historical financial indicators\n\n"
+    return header + f"{status}: {reason}"
+
+
+def _report_rc_frame(data: object, as_of: str) -> pd.DataFrame:
+    df = _tushare_data_to_frame(data)
+    if df.empty or "report_date" not in df.columns:
+        return pd.DataFrame()
+    as_of_compact = _compact_date(as_of)
+    df = df.copy()
+    df["report_date"] = df["report_date"].astype(str).str.replace("-", "", regex=False)
+    df = df[df["report_date"].str.len().eq(8)]
+    df = df[df["report_date"] <= as_of_compact]
+    if "quarter" in df.columns:
+        df = df[df["quarter"].notna()]
+        df = df[df["quarter"].astype(str).str.strip() != ""]
+    return df.reset_index(drop=True)
+
+
+def _fetch_report_rc(client, ts_code: str, as_of: str, window_days: int) -> tuple[pd.DataFrame, str]:
+    fields = ",".join(_REPORT_RC_FIELDS)
+    try:
+        as_of_date = pd.to_datetime(as_of).normalize()
+    except Exception:
+        return pd.DataFrame(), "parse_error"
+    start_date = (as_of_date - pd.Timedelta(days=window_days)).strftime("%Y%m%d")
+    end_date = as_of_date.strftime("%Y%m%d")
+    response = client.call_api(
+        "report_rc",
+        params={"ts_code": ts_code, "start_date": start_date, "end_date": end_date},
+        fields=fields,
+        cache_key=f"report_rc/{ts_code}/{start_date}_{end_date}.json",
+    )
+    if not response.ok:
+        return pd.DataFrame(), response.error or "tushare_upstream_error"
+    df = _report_rc_frame(response.data, as_of)
+    if df.empty:
+        return df, "no_sell_side_forecast"
+    return df, ""
+
+
+def _dedupe_report_rc(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    work = df.copy()
+    for col in ("org_name", "quarter"):
+        if col not in work.columns:
+            work[col] = ""
+        work[col] = work[col].astype(str).str.strip()
+    work = work.sort_values("report_date", ascending=False)
+    return work.drop_duplicates(subset=["org_name", "quarter"], keep="first").reset_index(drop=True)
+
+
+def _numeric_stats(series: pd.Series) -> dict[str, object]:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return {"count": 0, "mean": "N/A", "median": "N/A", "min": "N/A", "max": "N/A"}
+    return {
+        "count": int(values.count()),
+        "mean": round(float(values.mean()), 4),
+        "median": round(float(values.median()), 4),
+        "min": round(float(values.min()), 4),
+        "max": round(float(values.max()), 4),
+    }
+
+
+def _period_label(value: object) -> str:
+    text = str(value).strip()
+    match = _re.search(r"(20\d{2})", text)
+    return f"FY{match.group(1)}" if match else text
+
+
+def _aggregate_report_rc(df: pd.DataFrame) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    if df.empty or "quarter" not in df.columns:
+        return rows
+    for quarter, group in df.groupby("quarter", dropna=True):
+        org_count = group["org_name"].nunique() if "org_name" in group.columns else len(group)
+        latest_report_date = group["report_date"].max() if "report_date" in group.columns else ""
+        eps_stats = _numeric_stats(group["eps"] if "eps" in group.columns else pd.Series(dtype=float))
+        np_stats = _numeric_stats(group["np"] if "np" in group.columns else pd.Series(dtype=float))
+        op_rt_stats = _numeric_stats(group["op_rt"] if "op_rt" in group.columns else pd.Series(dtype=float))
+        rows.append({
+            "forecast_period": _period_label(quarter),
+            "quarter": quarter,
+            "institution_count": int(org_count),
+            "latest_report_date": latest_report_date,
+            "eps_count": eps_stats["count"],
+            "eps_mean": eps_stats["mean"],
+            "eps_median": eps_stats["median"],
+            "eps_min": eps_stats["min"],
+            "eps_max": eps_stats["max"],
+            "net_profit_count": np_stats["count"],
+            "net_profit_mean": np_stats["mean"],
+            "net_profit_median": np_stats["median"],
+            "net_profit_min": np_stats["min"],
+            "net_profit_max": np_stats["max"],
+            "revenue_count": op_rt_stats["count"],
+            "revenue_mean": op_rt_stats["mean"],
+            "revenue_median": op_rt_stats["median"],
+            "revenue_min": op_rt_stats["min"],
+            "revenue_max": op_rt_stats["max"],
+        })
+    return sorted(rows, key=lambda row: str(row["forecast_period"]))
+
 
 def get_profit_forecast(
     ticker: Annotated[str, "A-stock code"],
-    curr_date: Annotated[str, "current date (unused, for interface compat)"] = None,
+    curr_date: Annotated[str, "current date"] = None,
 ) -> str:
-    """Get consensus EPS forecasts with forward valuation (同花顺 direct HTTP)."""
+    """Get sell-side consensus EPS forecasts from Tushare report_rc."""
     code = _normalize_ticker(ticker)
+    ts_code = _tushare_ts_code(code)
+    as_of = curr_date or datetime.now().strftime("%Y-%m-%d")
 
     try:
-        df = _ths_eps_forecast(code)
+        from .tushare_client import get_tushare_client
 
-        if df is None or df.empty:
-            return f"No analyst coverage found for A-stock '{code}'"
+        client = get_tushare_client()
+        df, error = _fetch_report_rc(client, ts_code, as_of, 365)
+        stale_forecast_window = False
+        if df.empty and error == "no_sell_side_forecast":
+            df, error = _fetch_report_rc(client, ts_code, as_of, 730)
+            stale_forecast_window = not df.empty
+
+        if df.empty:
+            status = "no_coverage" if error == "no_sell_side_forecast" else "technical_error"
+            reason = "no_sell_side_forecast" if status == "no_coverage" else error
+            return _profit_forecast_error_header(
+                code, ts_code, as_of, status, reason, stale_forecast_window
+            )
+
+        deduped = _dedupe_report_rc(df)
+        if deduped.empty:
+            return _profit_forecast_error_header(
+                code,
+                ts_code,
+                as_of,
+                "no_coverage",
+                "no_sell_side_forecast",
+                stale_forecast_window,
+            )
+
+        report_dates = deduped["report_date"].dropna().astype(str)
+        report_date_range = (
+            f"{report_dates.min()}-{report_dates.max()}" if not report_dates.empty else "N/A"
+        )
+        source_count = len(deduped)
+        source_org_count = deduped["org_name"].nunique() if "org_name" in deduped.columns else source_count
+        low_coverage = source_org_count < 3
+        aggregates = _aggregate_report_rc(deduped)
+        if not aggregates:
+            return _profit_forecast_error_header(
+                code,
+                ts_code,
+                as_of,
+                "no_coverage",
+                "no_sell_side_forecast",
+                stale_forecast_window,
+            )
+
+        header = f"# Consensus EPS Forecast for {code} (A-stock)\n"
+        header += "# Source: Tushare report_rc sell-side forecast aggregation\n"
+        header += "# status: ok\n"
+        header += "# api=report_rc\n"
+        header += "# forecast_type=sell_side_forecast\n"
+        header += "# not_company_guidance=true\n"
+        header += f"# as_of: {as_of}\n"
+        header += "# as_of_field=report_date\n"
+        header += f"# report_date_range: {report_date_range}\n"
+        header += f"# source_count: {source_count}\n"
+        header += f"# source_org_count: {source_org_count}\n"
+        header += f"# low_coverage={str(low_coverage).lower()}\n"
+        header += f"# stale_forecast_window={str(stale_forecast_window).lower()}\n"
+        header += f"# ts_code: {ts_code}\n"
+        header += "# note: sell-side forecast aggregation; not company guidance, earnings preview, earnings flash, or historical financial indicators\n"
+        header += (
+            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        )
 
         lines = [
-            f"# Consensus EPS Forecast for {code} (A-stock)",
-            f"# Source: 同花顺 analyst consensus (direct HTTP)",
-            f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "This is sell-side forecast aggregation, not company guidance, earnings flash, or disclosed historical financial indicators.",
             "",
+            "forecast_period,quarter,institution_count,latest_report_date,eps_count,eps_mean,eps_median,eps_min,eps_max,net_profit_count,net_profit_mean,net_profit_median,net_profit_min,net_profit_max,revenue_count,revenue_mean,revenue_median,revenue_min,revenue_max",
         ]
+        for row in aggregates:
+            lines.append(",".join(str(row[col]) for col in [
+                "forecast_period",
+                "quarter",
+                "institution_count",
+                "latest_report_date",
+                "eps_count",
+                "eps_mean",
+                "eps_median",
+                "eps_min",
+                "eps_max",
+                "net_profit_count",
+                "net_profit_mean",
+                "net_profit_median",
+                "net_profit_min",
+                "net_profit_max",
+                "revenue_count",
+                "revenue_mean",
+                "revenue_median",
+                "revenue_min",
+                "revenue_max",
+            ]))
 
-        eps_by_year = {}
-        for _, row in df.iterrows():
-            year = str(row.iloc[0]) if len(row) > 0 else ""
-            count_val = row.iloc[1] if len(row) > 1 else 0
-            mean_eps_val = row.iloc[3] if len(row) > 3 else 0
-            min_eps_val = row.iloc[2] if len(row) > 2 else "N/A"
-            max_eps_val = row.iloc[4] if len(row) > 4 else "N/A"
-            try:
-                count = int(count_val)
-            except (ValueError, TypeError):
-                count = 0
-            try:
-                mean_eps = float(mean_eps_val)
-            except (ValueError, TypeError):
-                mean_eps = 0
-            lines.append(
-                f"FY{year}: EPS={mean_eps} (range {min_eps_val}~{max_eps_val}), "
-                f"analysts={count}"
-            )
-            if count < 3:
-                lines.append("  Warning: low coverage (<3 analysts)")
-            eps_by_year[year] = mean_eps
+        return header + "\n".join(lines)
 
-        # Forward valuation
-        try:
-            tq = _tencent_quote([code])
-            if code in tq:
-                price = tq[code]["price"]
-                pe_ttm = tq[code]["pe_ttm"]
-                lines.append(f"\nCurrent: price={price}, PE(TTM)={pe_ttm}")
-
-                years_sorted = sorted(eps_by_year.keys())
-                if years_sorted and eps_by_year.get(years_sorted[0], 0) > 0:
-                    eps_cur = eps_by_year[years_sorted[0]]
-                    fwd_pe = price / eps_cur
-                    lines.append(
-                        f"Forward PE (FY{years_sorted[0]}): {fwd_pe:.1f}x"
-                    )
-                    if (
-                        len(years_sorted) >= 2
-                        and eps_by_year.get(years_sorted[1], 0) > 0
-                    ):
-                        eps_next = eps_by_year[years_sorted[1]]
-                        cagr = eps_next / eps_cur - 1
-                        if cagr > 0:
-                            peg = fwd_pe / (cagr * 100)
-                            lines.append(
-                                f"PEG: {peg:.2f} (CAGR={cagr * 100:.0f}%)"
-                            )
-                            if fwd_pe > 30:
-                                digest = math.log(fwd_pe / 30) / math.log(
-                                    1 + cagr
-                                )
-                                lines.append(
-                                    f"PE Digestion to 30x: {digest:.1f} years"
-                                )
-                        else:
-                            lines.append(
-                                f"EPS declining ({cagr * 100:.0f}%), "
-                                f"PEG not applicable"
-                            )
-        except Exception as e:
-            logger.warning("Forward PE calc failed for %s: %s", code, e)
-
-        return "\n".join(lines)
-
-    except Exception as e:
-        return f"Error retrieving profit forecast for {code}: {str(e)}"
+    except Exception:
+        return _profit_forecast_error_header(
+            code, ts_code, as_of, "technical_error", "parse_error"
+        )
 
 
 # ---- 11. get_hot_stocks ----
