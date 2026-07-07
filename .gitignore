@@ -217,3 +217,10 @@ __marimo__/
 
 # Cache
 **/data_cache/
+
+# Local OS files
+.DS_Store
+
+# Recovery scrape cache files
+docs/recovery/tushare_pro_inventory/raw_html/
+docs/recovery/tushare_pro_inventory/scrape_summary.json
