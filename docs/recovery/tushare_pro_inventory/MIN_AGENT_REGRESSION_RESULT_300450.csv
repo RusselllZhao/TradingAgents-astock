@@ -1,0 +1,16 @@
+method,status,elapsed_seconds,result_length,first_batch,tushare_header,html_in_head,proxy_stack_in_head,bare_no_data_in_head
+get_industry_comparison,ok,0.552,411,no,no,no,yes,no
+get_balance_sheet,ok,0.63,1690,yes,yes,no,no,no
+get_cashflow,ok,0.63,1489,yes,yes,no,no,no
+get_income_statement,ok,0.63,1446,yes,yes,no,no,no
+get_profit_forecast,ok,0.638,1662,yes,yes,no,no,no
+get_fundamentals,ok,1.2,612,yes,yes,no,no,no
+get_cashflow,ok,0.018,1557,yes,yes,no,no,no
+get_balance_sheet,ok,0.019,1678,yes,yes,no,no,no
+get_income_statement,ok,0.021,1465,yes,yes,no,no,no
+get_hot_stocks,ok,0.445,2053,no,no,no,no,no
+get_concept_blocks,ok,0.61,1020,no,no,no,no,no
+get_industry_comparison,ok,0.219,411,no,no,no,yes,no
+get_dragon_tiger_board,ok,0.325,48,no,no,no,no,no
+get_northbound_flow,ok,0.333,716,no,no,no,no,no
+get_fund_flow,ok,0.341,5242,yes,yes,no,no,no
