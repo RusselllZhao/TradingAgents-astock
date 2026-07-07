@@ -1928,6 +1928,220 @@ def get_concept_blocks(
 
 # ---- 14. get_fund_flow ----
 
+_MONEYFLOW_FIELDS = [
+    "ts_code",
+    "trade_date",
+    "buy_sm_amount",
+    "sell_sm_amount",
+    "buy_md_amount",
+    "sell_md_amount",
+    "buy_lg_amount",
+    "sell_lg_amount",
+    "buy_elg_amount",
+    "sell_elg_amount",
+    "net_mf_amount",
+    "buy_sm_vol",
+    "sell_sm_vol",
+    "buy_md_vol",
+    "sell_md_vol",
+    "buy_lg_vol",
+    "sell_lg_vol",
+    "buy_elg_vol",
+    "sell_elg_vol",
+]
+
+_MONEYFLOW_DC_FIELDS = [
+    "ts_code",
+    "trade_date",
+    "close",
+    "pct_change",
+    "net_amount",
+    "net_amount_rate",
+    "buy_elg_amount",
+    "buy_lg_amount",
+    "buy_md_amount",
+    "buy_sm_amount",
+]
+
+
+def _fund_flow_error_header(
+    code: str,
+    ts_code: str,
+    as_of: str,
+    status: str,
+    reason: str,
+    api_name: str = "moneyflow",
+    fallback: str = "none",
+) -> str:
+    source = f"Tushare {api_name}"
+    header = f"# Fund Flow for {code} (A-stock)\n"
+    header += f"# Source: {source}\n"
+    header += f"# status: {status}\n"
+    header += "# frequency=daily\n"
+    header += "# scope=individual_stock\n"
+    header += f"# as_of: {as_of}\n"
+    header += "# trade_date: N/A\n"
+    header += f"# api={api_name}\n"
+    header += f"# fallback={fallback}\n"
+    header += f"# ts_code: {ts_code}\n"
+    header += f"# empty_reason: {reason}\n\n"
+    return header + f"{status}: {reason}"
+
+
+def _compact_date(date_str: str) -> str:
+    return str(date_str).replace("-", "")
+
+
+def _moneyflow_frame(data: object, as_of: str, limit: int) -> pd.DataFrame:
+    df = _tushare_data_to_frame(data)
+    if df.empty or "trade_date" not in df.columns:
+        return pd.DataFrame()
+    as_of_compact = _compact_date(as_of)
+    df = df.copy()
+    df["trade_date"] = df["trade_date"].astype(str).str.replace("-", "", regex=False)
+    df = df[df["trade_date"].str.len().eq(8)]
+    df = df[df["trade_date"] <= as_of_compact]
+    if df.empty:
+        return df
+    df = df.sort_values("trade_date", ascending=False).head(limit)
+    return df.sort_values("trade_date").reset_index(drop=True)
+
+
+def _fund_flow_query_params(ts_code: str, as_of: str, include_history: bool) -> list[dict[str, str]]:
+    as_of_date = pd.to_datetime(as_of).normalize()
+    if include_history:
+        start_date = (as_of_date - pd.Timedelta(days=45)).strftime("%Y%m%d")
+        return [
+            {
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": as_of_date.strftime("%Y%m%d"),
+            }
+        ]
+    return [
+        {
+            "ts_code": ts_code,
+            "trade_date": (as_of_date - pd.Timedelta(days=days_back)).strftime("%Y%m%d"),
+        }
+        for days_back in range(11)
+    ]
+
+
+def _fetch_tushare_fund_flow(
+    client,
+    api_name: str,
+    ts_code: str,
+    as_of: str,
+    include_history: bool,
+) -> tuple[pd.DataFrame, str]:
+    fields = ",".join(_MONEYFLOW_FIELDS if api_name == "moneyflow" else _MONEYFLOW_DC_FIELDS)
+    limit = 20 if include_history else 1
+    try:
+        queries = _fund_flow_query_params(ts_code, as_of, include_history)
+    except Exception:
+        return pd.DataFrame(), "parse_error"
+
+    last_empty_reason = "no_moneyflow_before_as_of"
+    for params in queries:
+        if include_history:
+            cache_key = f"{api_name}/{ts_code}/{params['start_date']}_{params['end_date']}.json"
+        else:
+            cache_key = f"{api_name}/{ts_code}/{params['trade_date']}.json"
+        response = client.call_api(
+            api_name,
+            params=params,
+            fields=fields,
+            cache_key=cache_key,
+        )
+        if not response.ok:
+            return pd.DataFrame(), response.error or "tushare_upstream_error"
+        df = _moneyflow_frame(response.data, as_of, limit)
+        if not df.empty:
+            return df, ""
+    return pd.DataFrame(), last_empty_reason
+
+
+def _add_moneyflow_net_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    pairs = [
+        ("small_order_net_amount", "buy_sm_amount", "sell_sm_amount"),
+        ("medium_order_net_amount", "buy_md_amount", "sell_md_amount"),
+        ("large_order_net_amount", "buy_lg_amount", "sell_lg_amount"),
+        ("extra_large_order_net_amount", "buy_elg_amount", "sell_elg_amount"),
+    ]
+    for target, buy_col, sell_col in pairs:
+        if buy_col in df.columns and sell_col in df.columns:
+            buy = pd.to_numeric(df[buy_col], errors="coerce")
+            sell = pd.to_numeric(df[sell_col], errors="coerce")
+            df[target] = buy - sell
+    return df
+
+
+def _fund_flow_summary(df: pd.DataFrame, amount_col: str) -> str:
+    if df.empty or amount_col not in df.columns:
+        return "Data summary: no strong interpretation attached"
+    value = pd.to_numeric(df.iloc[-1].get(amount_col), errors="coerce")
+    if pd.isna(value) or value == 0:
+        return "Data summary: no strong interpretation attached"
+    direction = "positive" if value > 0 else "negative"
+    return f"Data summary: {amount_col} {direction}"
+
+
+def _format_fund_flow_output(
+    code: str,
+    ts_code: str,
+    as_of: str,
+    api_name: str,
+    df: pd.DataFrame,
+    include_history: bool,
+    status: str = "ok",
+    fallback: str = "none",
+) -> str:
+    source = f"Tushare {api_name}"
+    date_values = df["trade_date"].astype(str).tolist() if "trade_date" in df.columns else []
+    trade_date = date_values[-1] if date_values else "N/A"
+    date_range = f"{date_values[0]}-{date_values[-1]}" if len(date_values) > 1 else trade_date
+    net_only = api_name == "moneyflow_dc"
+
+    if api_name == "moneyflow":
+        df = _add_moneyflow_net_columns(df)
+        preferred_cols = _MONEYFLOW_FIELDS + [
+            "small_order_net_amount",
+            "medium_order_net_amount",
+            "large_order_net_amount",
+            "extra_large_order_net_amount",
+        ]
+        summary = _fund_flow_summary(df, "net_mf_amount")
+    else:
+        preferred_cols = _MONEYFLOW_DC_FIELDS
+        summary = _fund_flow_summary(df, "net_amount")
+
+    ordered_cols = [col for col in preferred_cols if col in df.columns]
+    remaining_cols = [col for col in df.columns if col not in ordered_cols]
+    csv_string = df[ordered_cols + remaining_cols].to_csv(index=False)
+
+    header = f"# Fund Flow for {code} (A-stock)\n"
+    header += f"# Source: {source}\n"
+    header += f"# status: {status}\n"
+    header += "# frequency=daily\n"
+    header += "# scope=individual_stock\n"
+    header += f"# as_of: {as_of}\n"
+    header += f"# trade_date: {trade_date}\n"
+    header += f"# date_range: {date_range}\n"
+    header += f"# api={api_name}\n"
+    header += f"# fallback={fallback}\n"
+    header += f"# source_api={api_name}\n"
+    header += f"# net_only={str(net_only).lower()}\n"
+    header += f"# ts_code: {ts_code}\n"
+    header += f"# rows: {len(df)}\n"
+    header += f"# include_history: {str(include_history).lower()}\n"
+    header += "# note: individual stock daily fund flow only\n"
+    header += (
+        f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    )
+
+    return header + f"{summary}\n\n" + csv_string
+
 
 def get_fund_flow(
     ticker: Annotated[str, "A-stock code"],
@@ -1936,109 +2150,71 @@ def get_fund_flow(
         bool, "Include historical daily fund flow (last 20 days)"
     ] = True,
 ) -> str:
-    """Get individual stock fund flow from 东财 push2.
-
-    Realtime: minute-level main/large/medium/small/super order net inflow.
-    History: daily net inflow for 20 trading days (push2his).
-
-    V0.2.7: replaced 百度 PAE (fundflow/fundsortlist, offline since 2026-05)
-    with 东财 push2 fund flow API.
-    """
+    """Get individual stock daily fund flow from Tushare moneyflow."""
     code = _normalize_ticker(ticker)
-    secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
-    lines = [
-        f"# Fund Flow for {code} (A-stock)",
-        f"# Source: 东财 push2 (Eastmoney)",
-        f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "",
-    ]
+    ts_code = _tushare_ts_code(code)
+    as_of = curr_date or datetime.now().strftime("%Y-%m-%d")
 
     try:
-        # Realtime minute-level fund flow
-        url_rt = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
-        params_rt = {
-            "secid": secid, "klt": 1,
-            "fields1": "f1,f2,f3,f7",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57",
-        }
-        r = _em_get(url_rt, params=params_rt, timeout=10)
-        d = r.json()
-        klines = d.get("data", {}).get("klines", [])
+        from .tushare_client import get_tushare_client
 
-        if klines:
-            lines.append(
-                "## Realtime Minute Flow "
-                "(主力/小单/中单/大单/超大单 净流入, 元)"
+        client = get_tushare_client()
+        main_df, main_error = _fetch_tushare_fund_flow(
+            client, "moneyflow", ts_code, as_of, include_history
+        )
+        if not main_df.empty:
+            return _format_fund_flow_output(
+                code,
+                ts_code,
+                as_of,
+                "moneyflow",
+                main_df,
+                include_history,
+                status="ok",
+                fallback="none",
             )
-            for line in klines[-10:]:
-                parts = line.split(",")
-                if len(parts) >= 6:
-                    lines.append(
-                        f"  {parts[0]}: "
-                        f"主力={float(parts[1])/1e4:.0f}万 "
-                        f"大单={float(parts[4])/1e4:.0f}万 "
-                        f"超大单={float(parts[5])/1e4:.0f}万"
-                    )
 
-            last_parts = klines[-1].split(",")
-            if len(last_parts) >= 2:
-                main_net = float(last_parts[1])
-                lines.append(
-                    f"\nClose: 主力净流入={main_net/1e4:.0f}万元"
-                )
-                if main_net > 0:
-                    lines.append(
-                        "Signal: Net main force INFLOW (bullish)"
-                    )
-                elif main_net < 0:
-                    lines.append(
-                        "Signal: Net main force OUTFLOW (bearish)"
-                    )
+        fallback_df, fallback_error = _fetch_tushare_fund_flow(
+            client, "moneyflow_dc", ts_code, as_of, include_history
+        )
+        if not fallback_df.empty:
+            return _format_fund_flow_output(
+                code,
+                ts_code,
+                as_of,
+                "moneyflow_dc",
+                fallback_df,
+                include_history,
+                status="partial_data",
+                fallback="moneyflow_dc",
+            )
+
+        reason = fallback_error or main_error or "no_moneyflow_before_as_of"
+        if reason.startswith("no_") and (not main_error or main_error.startswith("no_")):
+            status = "no_data"
         else:
-            lines.append(
-                "No realtime fund flow (non-trading hours or holiday)"
-            )
+            status = "technical_error"
+            reason = main_error if main_error and not main_error.startswith("no_") else reason
+        return _fund_flow_error_header(
+            code,
+            ts_code,
+            as_of,
+            status,
+            reason,
+            api_name="moneyflow",
+            fallback="moneyflow_dc",
+        )
 
-        # Historical daily fund flow (push2his)
-        if include_history:
-            url_hist = (
-                "https://push2his.eastmoney.com"
-                "/api/qt/stock/fflow/daykline/get"
-            )
-            params_hist = {
-                "secid": secid, "lmt": 20, "klt": 101,
-                "fields1": "f1,f2,f3,f7",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57",
-            }
-            rh = _em_get(url_hist, params=params_hist, timeout=10)
-            dh = rh.json()
-            hist_klines = dh.get("data", {}).get("klines", [])
-
-            if hist_klines:
-                lines.append(
-                    f"\n## Historical Daily Fund Flow "
-                    f"(last {len(hist_klines)} trading days)"
-                )
-                lines.append(
-                    "Date | 主力净流入(万) | 大单(万) "
-                    "| 中单(万) | 小单(万) | 超大单(万)"
-                )
-                for line in hist_klines:
-                    parts = line.split(",")
-                    if len(parts) >= 6:
-                        lines.append(
-                            f"  {parts[0]} "
-                            f"| main={float(parts[1])/1e4:.0f} "
-                            f"| large={float(parts[4])/1e4:.0f} "
-                            f"| mid={float(parts[3])/1e4:.0f} "
-                            f"| small={float(parts[2])/1e4:.0f} "
-                            f"| super={float(parts[5])/1e4:.0f}"
-                        )
-
-        return "\n".join(lines)
-
-    except Exception as e:
-        return f"Error fetching fund flow for {code}: {str(e)}"
+    except Exception:
+        return _fund_flow_error_header(
+            code,
+            ts_code,
+            as_of,
+            "technical_error",
+            "parse_error",
+            api_name="moneyflow",
+            fallback="moneyflow_dc",
+        )
 
 
 # ---------------------------------------------------------------------------
