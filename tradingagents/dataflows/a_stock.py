@@ -700,178 +700,202 @@ def get_indicators(
 
 # ---- 3. get_fundamentals ----
 
+_FUNDAMENTALS_STOCK_BASIC_FIELDS = [
+    "ts_code",
+    "symbol",
+    "name",
+    "industry",
+    "market",
+    "list_date",
+]
+
+_FUNDAMENTALS_DAILY_BASIC_FIELDS = [
+    "ts_code",
+    "trade_date",
+    "close",
+    "pe",
+    "pe_ttm",
+    "pb",
+    "ps",
+    "ps_ttm",
+    "total_mv",
+    "circ_mv",
+    "turnover_rate",
+    "volume_ratio",
+    "total_share",
+    "float_share",
+]
+
+
+def _fundamentals_error_header(
+    code: str,
+    ts_code: str,
+    as_of: str,
+    status: str,
+    reason: str,
+    trade_date: str = "N/A",
+) -> str:
+    header = f"# Company Fundamentals for {code} (A-stock)\n"
+    header += "# Source: Tushare daily_basic + stock_basic\n"
+    header += f"# status: {status}\n"
+    header += "# realtime=false\n"
+    header += f"# as_of: {as_of}\n"
+    header += f"# trade_date: {trade_date}\n"
+    header += "# api=daily_basic,stock_basic\n"
+    header += f"# ts_code: {ts_code}\n"
+    header += f"# empty_reason: {reason}\n\n"
+    return header + f"{status}: {reason}"
+
+
+def _fundamentals_clean_value(value: object) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        if pd.isna(value):
+            return "N/A"
+    except TypeError:
+        pass
+    text = str(value).strip()
+    return text if text else "N/A"
+
+
+def _first_tushare_row(data: object) -> dict[str, object]:
+    df = _tushare_data_to_frame(data)
+    if df.empty:
+        return {}
+    return df.iloc[0].to_dict()
+
+
+def _fetch_stock_basic_row(client, ts_code: str) -> tuple[dict[str, object], str]:
+    fields = ",".join(_FUNDAMENTALS_STOCK_BASIC_FIELDS)
+    response = client.call_api(
+        "stock_basic",
+        params={"list_status": "L"},
+        fields=fields,
+        cache_key="stock_basic/list_status_L.json",
+    )
+    if not response.ok:
+        return {}, response.error or "tushare_upstream_error"
+
+    df = _tushare_data_to_frame(response.data)
+    if df.empty or "ts_code" not in df.columns:
+        return {}, "no_stock_basic_match"
+
+    matched = df[df["ts_code"].astype(str) == ts_code]
+    if matched.empty:
+        return {}, "no_stock_basic_match"
+    return matched.iloc[0].to_dict(), ""
+
+
+def _fetch_daily_basic_row(
+    client,
+    ts_code: str,
+    as_of: str,
+    lookback_days: int = 10,
+) -> tuple[dict[str, object], str]:
+    fields = ",".join(_FUNDAMENTALS_DAILY_BASIC_FIELDS)
+    try:
+        as_of_date = pd.to_datetime(as_of).normalize()
+    except Exception:
+        return {}, "parse_error"
+
+    for days_back in range(lookback_days + 1):
+        trade_date = (as_of_date - pd.Timedelta(days=days_back)).strftime("%Y%m%d")
+        response = client.call_api(
+            "daily_basic",
+            params={"ts_code": ts_code, "trade_date": trade_date},
+            fields=fields,
+            cache_key=f"daily_basic/{ts_code}/{trade_date}.json",
+        )
+        if not response.ok:
+            return {}, response.error or "tushare_upstream_error"
+        row = _first_tushare_row(response.data)
+        if row:
+            return row, ""
+
+    return {}, "no_daily_basic_before_as_of"
+
 
 def get_fundamentals(
     ticker: Annotated[str, "A-stock code"],
     curr_date: Annotated[str, "current date"] = None,
 ) -> str:
-    """Get company fundamentals from Tencent + mootdx + Eastmoney + 同花顺."""
+    """Get core fundamentals from Tushare daily_basic + stock_basic."""
     code = _normalize_ticker(ticker)
+    ts_code = _tushare_ts_code(code)
+    as_of = curr_date or datetime.now().strftime("%Y-%m-%d")
 
     try:
-        lines = []
+        from .tushare_client import get_tushare_client
 
-        # --- Tencent: real-time valuation ---
-        try:
-            tq = _tencent_quote([code])
-            if code in tq:
-                q = tq[code]
-                lines.extend(
-                    [
-                        f"Name: {q['name']}",
-                        f"Price: {q['price']}",
-                        f"PE (TTM): {q['pe_ttm']}",
-                        f"PE (Static): {q['pe_static']}",
-                        f"PB: {q['pb']}",
-                        f"Market Cap (100M CNY): {q['mcap_yi']}",
-                        f"Float Market Cap (100M CNY): {q['float_mcap_yi']}",
-                        f"Turnover Rate: {q['turnover_pct']}%",
-                        f"Change: {q['change_pct']}%",
-                        f"Limit Up: {q['limit_up']}",
-                        f"Limit Down: {q['limit_down']}",
-                    ]
-                )
-        except Exception as e:
-            logger.warning("Tencent quote failed for %s: %s", code, e)
+        client = get_tushare_client()
+        stock_row, stock_error = _fetch_stock_basic_row(client, ts_code)
+        daily_row, daily_error = _fetch_daily_basic_row(client, ts_code, as_of)
 
-        # --- mootdx: financial snapshot (quarterly) ---
-        try:
-            client = _get_mootdx_client()
-            fin = client.finance(symbol=code)
-            if fin is not None and not (
-                isinstance(fin, pd.DataFrame) and fin.empty
-            ):
-                row = fin.iloc[0] if isinstance(fin, pd.DataFrame) else fin
-                field_map = {
-                    "eps": "EPS (Quarterly)",
-                    "bvps": "Book Value Per Share",
-                    "roe": "ROE (%)",
-                    "profit": "Net Profit",
-                    "income": "Revenue",
-                    "liutongguben": "Float Shares",
-                    "zongguben": "Total Shares",
-                }
-                idx = row.index if hasattr(row, "index") else []
-                for field, label in field_map.items():
-                    if field in idx:
-                        val = row[field]
-                        if val is not None and str(val) != "nan":
-                            lines.append(f"{label}: {val}")
-        except Exception as e:
-            logger.warning("mootdx finance failed for %s: %s", code, e)
+        stock_ok = bool(stock_row)
+        daily_ok = bool(daily_row)
+        if not stock_ok and not daily_ok:
+            reason = daily_error if daily_error.startswith("no_") else daily_error or stock_error
+            status = "no_data" if reason.startswith("no_") else "technical_error"
+            if stock_error and not stock_error.startswith("no_"):
+                reason = stock_error
+                status = "technical_error"
+            return _fundamentals_error_header(code, ts_code, as_of, status, reason)
 
-        # --- Eastmoney push2: basic stock info (direct HTTP) ---
-        try:
-            market_code = 1 if code.startswith("6") else 0
-            _info_url = "https://push2.eastmoney.com/api/qt/stock/get"
-            _info_params = {
-                "fltt": "2",
-                "invt": "2",
-                "fields": "f57,f58,f84,f85,f127,f116,f117,f189,f43",
-                "secid": f"{market_code}.{code}",
-            }
-            r = _em_get(_info_url, params=_info_params, timeout=10)
-            d = r.json().get("data", {})
-            if d:
-                if d.get("f127"):
-                    lines.append(f"行业: {d['f127']}")
-                if d.get("f84"):
-                    lines.append(f"总股本: {d['f84']}")
-                if d.get("f85"):
-                    lines.append(f"流通股本: {d['f85']}")
-                if d.get("f116"):
-                    lines.append(f"总市值: {d['f116']}")
-                if d.get("f117"):
-                    lines.append(f"流通市值: {d['f117']}")
-                if d.get("f189"):
-                    lines.append(f"上市日期: {d['f189']}")
-        except Exception as e:
-            logger.warning("eastmoney push2 stock info failed for %s: %s", code, e)
+        missing_sources = []
+        empty_reasons = []
+        if not stock_ok:
+            missing_sources.append("stock_basic")
+            empty_reasons.append(stock_error or "no_stock_basic_match")
+        if not daily_ok:
+            missing_sources.append("daily_basic")
+            empty_reasons.append(daily_error or "no_daily_basic_before_as_of")
 
-        # --- 同花顺 direct HTTP: consensus EPS forecast ---
-        try:
-            forecast_df = _ths_eps_forecast(code)
-            if forecast_df is not None and not forecast_df.empty:
-                lines.append("\n--- Consensus EPS Forecast (同花顺) ---")
-                eps_by_year = {}
-                for _, row in forecast_df.iterrows():
-                    year = str(row.iloc[0]) if len(row) > 0 else ""
-                    mean_eps_val = row.iloc[3] if len(row) > 3 else 0
-                    count_val = row.iloc[1] if len(row) > 1 else 0
-                    min_eps_val = row.iloc[2] if len(row) > 2 else "N/A"
-                    max_eps_val = row.iloc[4] if len(row) > 4 else "N/A"
-                    try:
-                        mean_eps = float(mean_eps_val)
-                    except (ValueError, TypeError):
-                        mean_eps = 0
-                    try:
-                        count = int(count_val)
-                    except (ValueError, TypeError):
-                        count = 0
-                    lines.append(
-                        f"FY{year}: EPS={mean_eps} "
-                        f"(range {min_eps_val}~{max_eps_val}, {count} analysts)"
-                    )
-                    if count < 3:
-                        lines.append("  Warning: low coverage (<3 analysts)")
-                    eps_by_year[year] = mean_eps
-
-                # Forward PE / PEG / PE digestion
-                try:
-                    tq = _tencent_quote([code])
-                    if code in tq:
-                        price = tq[code]["price"]
-                        years_sorted = sorted(eps_by_year.keys())
-                        if years_sorted and eps_by_year.get(years_sorted[0], 0) > 0:
-                            eps_cur = eps_by_year[years_sorted[0]]
-                            fwd_pe = price / eps_cur
-                            lines.append(
-                                f"\nForward PE (FY{years_sorted[0]}): "
-                                f"{fwd_pe:.1f}x (price={price}, EPS={eps_cur})"
-                            )
-                            if (
-                                len(years_sorted) >= 2
-                                and eps_by_year.get(years_sorted[1], 0) > 0
-                            ):
-                                eps_next = eps_by_year[years_sorted[1]]
-                                cagr = eps_next / eps_cur - 1
-                                if cagr > 0:
-                                    peg = fwd_pe / (cagr * 100)
-                                    lines.append(
-                                        f"PEG: {peg:.2f} "
-                                        f"(EPS CAGR={cagr * 100:.0f}%)"
-                                    )
-                                    if fwd_pe > 30:
-                                        digest = math.log(fwd_pe / 30) / math.log(
-                                            1 + cagr
-                                        )
-                                        lines.append(
-                                            f"PE Digestion to 30x: {digest:.1f} years"
-                                        )
-                                    else:
-                                        lines.append("PE already below 30x target")
-                                else:
-                                    lines.append(
-                                        f"EPS declining ({cagr * 100:.0f}%), "
-                                        f"PEG not applicable"
-                                    )
-                except Exception as e:
-                    logger.warning("Forward PE calc failed for %s: %s", code, e)
-        except Exception as e:
-            logger.warning("Consensus EPS forecast failed for %s: %s", code, e)
-
-        if not lines:
-            return f"No fundamentals data found for A-stock '{code}'"
+        status = "ok" if stock_ok and daily_ok else "partial_data"
+        trade_date = _fundamentals_clean_value(daily_row.get("trade_date"))
 
         header = f"# Company Fundamentals for {code} (A-stock)\n"
+        header += "# Source: Tushare daily_basic + stock_basic\n"
+        header += f"# status: {status}\n"
+        header += "# realtime=false\n"
+        header += f"# as_of: {as_of}\n"
+        header += f"# trade_date: {trade_date}\n"
+        header += "# api=daily_basic,stock_basic\n"
+        header += f"# ts_code: {ts_code}\n"
+        if missing_sources:
+            header += f"# missing_source: {','.join(missing_sources)}\n"
+            header += f"# empty_reason: {','.join(empty_reasons)}\n"
         header += (
             f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         )
 
+        lines = [
+            f"Stock Code: {ts_code}",
+            f"Name: {_fundamentals_clean_value(stock_row.get('name'))}",
+            f"Industry: {_fundamentals_clean_value(stock_row.get('industry'))}",
+            f"Market: {_fundamentals_clean_value(stock_row.get('market'))}",
+            f"List Date: {_fundamentals_clean_value(stock_row.get('list_date'))}",
+            f"Trade Date: {trade_date}",
+            f"Close: {_fundamentals_clean_value(daily_row.get('close'))}",
+            f"PE: {_fundamentals_clean_value(daily_row.get('pe'))}",
+            f"PE (TTM): {_fundamentals_clean_value(daily_row.get('pe_ttm'))}",
+            f"PB: {_fundamentals_clean_value(daily_row.get('pb'))}",
+            f"PS: {_fundamentals_clean_value(daily_row.get('ps'))}",
+            f"PS (TTM): {_fundamentals_clean_value(daily_row.get('ps_ttm'))}",
+            f"Market Cap (10K CNY): {_fundamentals_clean_value(daily_row.get('total_mv'))}",
+            f"Float Market Cap (10K CNY): {_fundamentals_clean_value(daily_row.get('circ_mv'))}",
+            f"Turnover Rate: {_fundamentals_clean_value(daily_row.get('turnover_rate'))}",
+            f"Volume Ratio: {_fundamentals_clean_value(daily_row.get('volume_ratio'))}",
+            f"Total Shares (10K): {_fundamentals_clean_value(daily_row.get('total_share'))}",
+            f"Float Shares (10K): {_fundamentals_clean_value(daily_row.get('float_share'))}",
+        ]
+
         return header + "\n".join(lines)
 
-    except Exception as e:
-        return f"Error retrieving fundamentals for {code}: {str(e)}"
+    except Exception:
+        return _fundamentals_error_header(
+            code, ts_code, as_of, "technical_error", "parse_error"
+        )
 
 
 # ---- 4. get_balance_sheet ----
