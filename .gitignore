@@ -149,6 +149,7 @@ activemq-data/
 
 # Environments
 .env
+.env.local
 .envrc
 .venv
 env/
@@ -217,6 +218,10 @@ __marimo__/
 
 # Cache
 **/data_cache/
+.cache/tushare/
+
+# Local credentials
+config/local_tushare.toml
 
 # Local OS files
 .DS_Store
