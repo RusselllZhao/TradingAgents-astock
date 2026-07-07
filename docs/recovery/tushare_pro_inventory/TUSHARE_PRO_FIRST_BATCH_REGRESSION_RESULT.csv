@@ -1,0 +1,19 @@
+function,input,status,output_length,source_ok,api,api_ok,date_ok,security_ok,semantic_ok,format_ok,passed,notes
+get_balance_sheet,"get_balance_sheet('600519', 'quarterly', '2026-07-07')",ok,1695,True,balancesheet,True,True,True,True,True,True,ok
+get_balance_sheet,"get_balance_sheet('600519', 'annual', '2026-07-07')",ok,1666,True,balancesheet,True,True,True,True,True,True,ok
+get_cashflow,"get_cashflow('600519', 'quarterly', '2026-07-07')",ok,1523,True,cashflow,True,True,True,True,True,True,ok
+get_cashflow,"get_cashflow('300750', 'annual', '2026-07-07')",ok,1571,True,cashflow,True,True,True,True,True,True,ok
+get_income_statement,"get_income_statement('600519', 'quarterly', '2026-07-07')",ok,1507,True,income,True,True,True,True,True,True,ok
+get_income_statement,"get_income_statement('300750', 'annual', '2026-07-07')",ok,1475,True,income,True,True,True,True,True,True,ok
+get_fundamentals,"get_fundamentals('600519', '2026-07-07')",ok,617,True,"daily_basic,stock_basic",True,True,True,True,True,True,ok
+get_fundamentals,"get_fundamentals('300750', '2026-07-07')",ok,622,True,"daily_basic,stock_basic",True,True,True,True,True,True,ok
+get_fundamentals,"get_fundamentals('300450', '2026-07-07')",ok,612,True,"daily_basic,stock_basic",True,True,True,True,True,True,ok
+get_fundamentals,"get_fundamentals('688981', '2026-07-07')",ok,621,True,"daily_basic,stock_basic",True,True,True,True,True,True,ok
+get_fund_flow,"get_fund_flow('300750', '2026-07-07', include_history=True)",ok,5351,True,moneyflow,True,True,True,True,True,True,ok
+get_fund_flow,"get_fund_flow('600519', '2026-07-07', include_history=False)",ok,993,True,moneyflow,True,True,True,True,True,True,ok
+get_fund_flow,"get_fund_flow('300450', '2026-07-07', include_history=True)",ok,5242,True,moneyflow,True,True,True,True,True,True,ok
+get_fund_flow,"get_fund_flow('688981', '2026-07-07', include_history=False)",ok,1019,True,moneyflow,True,True,True,True,True,True,ok
+get_profit_forecast,"get_profit_forecast('600519', '2026-07-07')",ok,1858,True,report_rc,True,True,True,True,True,True,ok
+get_profit_forecast,"get_profit_forecast('300750', '2026-07-07')",ok,1781,True,report_rc,True,True,True,True,True,True,ok
+get_profit_forecast,"get_profit_forecast('300450', '2026-07-07')",ok,1662,True,report_rc,True,True,True,True,True,True,ok
+get_profit_forecast,"get_profit_forecast('688981', '2026-07-07')",ok,1498,True,report_rc,True,True,True,True,True,True,ok
