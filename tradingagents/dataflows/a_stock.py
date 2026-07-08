@@ -1841,84 +1841,222 @@ def get_profit_forecast(
 
 # ---- 11. get_hot_stocks ----
 
+_HOT_STOCK_FIELDS = [
+    "trade_date",
+    "data_type",
+    "ts_code",
+    "ts_name",
+    "rank",
+    "pct_change",
+    "current_price",
+    "concept",
+    "rank_reason",
+]
+
+
+def _hot_stocks_contract_header(
+    *,
+    status: str,
+    as_of: str,
+    trade_date: str,
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    notes: str = "",
+) -> str:
+    return _build_data_source_contract_header(
+        status=status,
+        source="Tushare ths_hot",
+        data_type="hot_stocks",
+        query_target="market",
+        symbol="N/A",
+        as_of=as_of,
+        trade_date=trade_date,
+        unit="rank; pct_change percent; current_price CNY; other fields raw Tushare",
+        coverage="market_wide",
+        fallback="none",
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+        limitations="market-wide hot-stock ranking only; no limit-up pool or consecutive limit-up ladder included",
+        notes=notes,
+    )
+
+
+def _hot_stocks_short_message(
+    *,
+    status: str,
+    as_of: str,
+    trade_date: str = "N/A",
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    message: str,
+) -> str:
+    header = _hot_stocks_contract_header(
+        status=status,
+        as_of=as_of,
+        trade_date=trade_date,
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+    )
+    return f"{header}\n\n{message}"
+
+
+def _hot_stocks_query_dates(as_of: str, max_weekdays: int = 15) -> tuple[str, list[str]]:
+    as_of_dt = pd.to_datetime(as_of).normalize()
+    dates: list[str] = []
+    cursor = as_of_dt
+    while len(dates) < max_weekdays:
+        if cursor.weekday() < 5:
+            dates.append(cursor.strftime("%Y%m%d"))
+        cursor -= pd.Timedelta(days=1)
+    return as_of_dt.strftime("%Y-%m-%d"), dates
+
+
+def _hot_stocks_frame(data: object, as_of: str) -> pd.DataFrame:
+    df = _tushare_data_to_frame(data)
+    if df.empty:
+        return df
+    if "trade_date" not in df.columns or "ts_code" not in df.columns:
+        raise ValueError("unexpected_schema: ths_hot missing trade_date/ts_code")
+
+    as_of_compact = as_of.replace("-", "")
+    df = df.copy()
+    df["trade_date"] = df["trade_date"].astype(str).str.replace("-", "", regex=False)
+    df = df[df["trade_date"].str.len().eq(8)]
+    df = df[df["trade_date"] <= as_of_compact]
+    if df.empty:
+        return df
+
+    latest_trade_date = df["trade_date"].max()
+    df = df[df["trade_date"] == latest_trade_date]
+    available_columns = [field for field in _HOT_STOCK_FIELDS if field in df.columns]
+    df = df[available_columns]
+    if "rank" in df.columns:
+        df = df.sort_values("rank")
+    return df.reset_index(drop=True)
+
+
+def _hot_stocks_markdown_table(df: pd.DataFrame, columns: list[str]) -> str:
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for _, row in df.iterrows():
+        values: list[str] = []
+        for column in columns:
+            value = row.get(column, "")
+            if pd.isna(value):
+                values.append("")
+            elif isinstance(value, float):
+                values.append(f"{value:.2f}")
+            else:
+                text = str(value).replace("\n", " ").replace("|", "/")
+                if len(text) > 180:
+                    text = text[:177] + "..."
+                values.append(text)
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
+def _format_hot_stocks_output(
+    as_of: str,
+    attempted_dates: list[str],
+    df: pd.DataFrame,
+) -> str:
+    columns = [field for field in _HOT_STOCK_FIELDS if field in df.columns]
+    trade_date = str(df["trade_date"].iloc[0]) if "trade_date" in df.columns else "N/A"
+    header = _hot_stocks_contract_header(
+        status="ok",
+        as_of=as_of,
+        trade_date=trade_date,
+        notes=f"attempted_trade_dates={','.join(attempted_dates)}; rows={len(df)}",
+    )
+    lines = [
+        "# Market Hot-Stock Ranking",
+        "",
+        _hot_stocks_markdown_table(df, columns),
+    ]
+    return f"{header}\n\n" + "\n".join(lines)
+
 
 def get_hot_stocks(
     curr_date: Annotated[str, "Date YYYY-MM-DD, empty string for today"] = "",
 ) -> str:
-    """Get strong stocks with topic attribution from 同花顺 editorial team.
-
-    Returns stocks that hit limit-up with human-curated reason tags
-    explaining WHY they surged (e.g. '算力租赁+AI政务').
-    """
-    import requests
-
+    """Get market-wide hot-stock ranking via Tushare ths_hot."""
     if not curr_date or curr_date.strip() == "":
         curr_date = datetime.now().strftime("%Y-%m-%d")
 
     try:
-        url = (
-            f"http://zx.10jqka.com.cn/event/api/getharden/"
-            f"date/{curr_date}/orderby/date/orderway/desc/charset/GBK/"
+        as_of, candidate_dates = _hot_stocks_query_dates(curr_date)
+    except Exception:
+        as_of = str(curr_date)
+        return _hot_stocks_short_message(
+            status="invalid_input",
+            as_of=as_of,
+            empty_reason="not_applicable",
+            message="Invalid date input for hot-stock ranking query.",
         )
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "Chrome/117.0.0.0 Safari/537.36"
+
+    try:
+        from .tushare_client import get_tushare_client
+
+        client = get_tushare_client()
+        technical_errors: list[str] = []
+        empty_dates: list[str] = []
+        attempted_dates: list[str] = []
+
+        for trade_date in candidate_dates:
+            attempted_dates.append(trade_date)
+            response = client.call_api(
+                "ths_hot",
+                params={"trade_date": trade_date, "market": "热股", "is_new": "Y"},
+                fields=",".join(_HOT_STOCK_FIELDS),
+                cache_key=f"ths_hot/{trade_date}_hot_new.json",
+                use_cache=False,
             )
-        }
-        r = requests.get(url, headers=headers, timeout=10)
-        data = r.json()
+            if not response.ok:
+                technical_errors.append(response.error or response.message or "")
+                continue
 
-        if data.get("errocode", 0) != 0:
-            return f"同花顺 API error: {data.get('errormsg', 'unknown')}"
+            df = _hot_stocks_frame(response.data, as_of)
+            if df.empty:
+                empty_dates.append(trade_date)
+                continue
 
-        rows = data.get("data") or []
-        if not rows:
-            return (
-                f"No hot stocks data for {curr_date} "
-                f"(may be non-trading day or data not yet available)"
-            )
+            return _format_hot_stocks_output(as_of, attempted_dates, df)
 
-        lines = [
-            f"# Hot Stocks with Topic Attribution ({curr_date})",
-            f"# Source: 同花顺 editorial (human-curated reason tags)",
-            f"# Total: {len(rows)} stocks",
-            "",
-        ]
-
-        from collections import Counter
-
-        all_tags: list[str] = []
-
-        for row in rows:
-            code = row.get("code", "")
-            name = row.get("name", "")
-            reason = row.get("reason", "")
-            zhangfu = row.get("zhangfu", "")
-            huanshou = row.get("huanshou", "")
-            chengjiaoe = row.get("chengjiaoe", "")
-            dde = row.get("ddejingliang", "")
-
-            lines.append(
-                f"{code} {name}: +{zhangfu}% "
-                f"换手{huanshou}% 成交额{chengjiaoe} "
-                f"大单净量{dde} | {reason}"
+        if technical_errors and not empty_dates:
+            error_type = _classify_data_source_error(technical_errors[0])
+            return _hot_stocks_short_message(
+                status="technical_error",
+                as_of=as_of,
+                error_type=error_type,
+                raw_error_suppressed=True,
+                message="Data source request failed; raw technical details suppressed.",
             )
 
-            if reason:
-                tags = [t.strip() for t in str(reason).split("+") if t.strip()]
-                all_tags.extend(tags)
+        return _hot_stocks_short_message(
+            status="empty",
+            as_of=as_of,
+            empty_reason="source_empty",
+            message=(
+                "Tushare ths_hot returned no hot-stock ranking rows for the "
+                "recent trade-date query window."
+            ),
+        )
 
-        if all_tags:
-            cnt = Counter(all_tags)
-            lines.append(f"\n## Theme Frequency (top 15)")
-            for tag, n in cnt.most_common(15):
-                lines.append(f"  {tag}: {n} stocks")
-
-        return "\n".join(lines)
-
-    except Exception as e:
-        return f"Error fetching hot stocks for {curr_date}: {str(e)}"
+    except Exception as exc:
+        error_type = _classify_data_source_error(exc)
+        return _hot_stocks_short_message(
+            status="technical_error",
+            as_of=as_of,
+            error_type=error_type,
+            raw_error_suppressed=True,
+            message="Data source request failed; raw technical details suppressed.",
+        )
 
 
 # ---- 12. get_northbound_flow ----
