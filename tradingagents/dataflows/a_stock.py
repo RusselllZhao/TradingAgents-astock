@@ -2797,128 +2797,353 @@ def get_fund_flow(
 # 15. Dragon Tiger Board (龙虎榜)
 # ---------------------------------------------------------------------------
 
+_DRAGON_TIGER_EVENT_FIELDS = [
+    "trade_date",
+    "ts_code",
+    "name",
+    "close",
+    "pct_change",
+    "turnover_rate",
+    "amount",
+    "l_sell",
+    "l_buy",
+    "l_amount",
+    "net_amount",
+    "reason",
+]
+
+_DRAGON_TIGER_INST_FIELDS = [
+    "trade_date",
+    "ts_code",
+    "exalter",
+    "side",
+    "buy",
+    "buy_rate",
+    "sell",
+    "sell_rate",
+    "net_buy",
+]
+
+
+def _dragon_tiger_contract_header(
+    *,
+    status: str,
+    symbol: str,
+    as_of: str,
+    trade_date: str,
+    coverage: str = "event_lookup",
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    notes: str = "",
+) -> str:
+    return _build_data_source_contract_header(
+        status=status,
+        source="Tushare top_list + top_inst",
+        data_type="dragon_tiger_event",
+        query_target="event",
+        symbol=symbol,
+        as_of=as_of,
+        trade_date=trade_date,
+        unit="CNY 10k for amount fields where provided by Tushare; ratio fields percent",
+        coverage=coverage,
+        fallback="none",
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+        limitations="dragon-tiger event lookup only; no investment interpretation attached",
+        notes=notes,
+    )
+
+
+def _dragon_tiger_short_message(
+    *,
+    status: str,
+    symbol: str,
+    as_of: str,
+    trade_date: str = "N/A",
+    coverage: str = "event_lookup",
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    message: str,
+) -> str:
+    header = _dragon_tiger_contract_header(
+        status=status,
+        symbol=symbol,
+        as_of=as_of,
+        trade_date=trade_date,
+        coverage=coverage,
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+    )
+    return f"{header}\n\n{message}"
+
+
+def _dragon_tiger_ts_code(ticker: str) -> tuple[str, bool]:
+    try:
+        code = _normalize_ticker(str(ticker))
+    except Exception:
+        return str(ticker or "N/A"), False
+    if not _re.fullmatch(r"\d{6}", code):
+        return code or "N/A", False
+    return _tushare_ts_code(code), True
+
+
+def _dragon_tiger_query_dates(as_of: str, look_back_days: int) -> tuple[str, str, list[str]]:
+    as_of_dt = pd.to_datetime(as_of).normalize()
+    days = int(look_back_days)
+    if days < 1:
+        raise ValueError("look_back_days must be positive")
+    start_dt = as_of_dt - pd.Timedelta(days=days)
+    dates: list[str] = []
+    cursor = as_of_dt
+    while cursor >= start_dt:
+        if cursor.weekday() < 5:
+            dates.append(cursor.strftime("%Y%m%d"))
+        cursor -= pd.Timedelta(days=1)
+    return as_of_dt.strftime("%Y-%m-%d"), start_dt.strftime("%Y%m%d"), dates
+
+
+def _dragon_tiger_filter_frame(
+    data: object,
+    fields: list[str],
+    ts_code: str,
+    as_of: str,
+) -> pd.DataFrame:
+    df = _tushare_data_to_frame(data)
+    if df.empty:
+        return df
+    if "trade_date" not in df.columns or "ts_code" not in df.columns:
+        raise ValueError("unexpected_schema: dragon-tiger data missing trade_date/ts_code")
+
+    as_of_compact = as_of.replace("-", "")
+    df = df.copy()
+    df["ts_code"] = df["ts_code"].astype(str).str.upper()
+    df["trade_date"] = df["trade_date"].astype(str).str.replace("-", "", regex=False)
+    df = df[(df["ts_code"] == ts_code.upper()) & df["trade_date"].str.len().eq(8)]
+    df = df[df["trade_date"] <= as_of_compact]
+    if df.empty:
+        return df
+
+    available_columns = [field for field in fields if field in df.columns]
+    return df[available_columns].reset_index(drop=True)
+
+
+def _dragon_tiger_markdown_table(df: pd.DataFrame, columns: list[str]) -> str:
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for _, row in df.iterrows():
+        values: list[str] = []
+        for column in columns:
+            value = row.get(column, "")
+            if pd.isna(value):
+                values.append("")
+            elif isinstance(value, float):
+                values.append(f"{value:.2f}")
+            else:
+                text = str(value).replace("\n", " ").replace("|", "/")
+                if len(text) > 180:
+                    text = text[:177] + "..."
+                values.append(text)
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
+def _format_dragon_tiger_output(
+    *,
+    status: str,
+    ts_code: str,
+    as_of: str,
+    start_date: str,
+    queried_dates: list[str],
+    events_df: pd.DataFrame,
+    inst_df: pd.DataFrame,
+    detail_note: str,
+) -> str:
+    event_columns = [field for field in _DRAGON_TIGER_EVENT_FIELDS if field in events_df.columns]
+    inst_columns = [field for field in _DRAGON_TIGER_INST_FIELDS if field in inst_df.columns]
+    event_dates = events_df["trade_date"].astype(str).tolist() if "trade_date" in events_df.columns else []
+    latest_trade_date = max(event_dates) if event_dates else "N/A"
+    notes = (
+        f"query_window={start_date}-{as_of.replace('-', '')}; "
+        f"queried_trade_dates={len(queried_dates)}; events={len(events_df)}"
+    )
+    if detail_note:
+        notes += f"; {detail_note}"
+
+    header = _dragon_tiger_contract_header(
+        status=status,
+        symbol=ts_code,
+        as_of=as_of,
+        trade_date=latest_trade_date,
+        notes=notes,
+    )
+    lines = [
+        "# Dragon-Tiger Board Events",
+        "",
+        "## Event List",
+        "",
+        _dragon_tiger_markdown_table(events_df, event_columns),
+    ]
+    if not inst_df.empty:
+        lines.extend([
+            "",
+            "## Seat / Institution Details",
+            "",
+            _dragon_tiger_markdown_table(inst_df, inst_columns),
+        ])
+    elif detail_note:
+        lines.extend([
+            "",
+            "## Seat / Institution Details",
+            "",
+            "Seat / institution details unavailable for the matched event rows.",
+        ])
+    return f"{header}\n\n" + "\n".join(lines)
+
+
 def get_dragon_tiger_board(
     ticker: str,
     trade_date: str,
     look_back_days: int = 30,
 ) -> str:
-    """Get dragon-tiger board (龙虎榜) appearances and seat details.
-
-    Args:
-        ticker: 6-digit A-share code, e.g. '000858'
-        trade_date: YYYY-MM-DD
-        look_back_days: how many days back to search (default 30)
-
-    Returns:
-        Formatted text with LHB appearances, top buyer/seller seats,
-        and institutional activity.
-    """
-    code = safe_ticker_component(ticker)
-    end_dt = datetime.strptime(trade_date, "%Y-%m-%d")
-    start_dt = end_dt - pd.Timedelta(days=look_back_days)
-    start_date_str = start_dt.strftime("%Y-%m-%d")
-    lines = [f"# 龙虎榜数据 | {code} | {trade_date} (近{look_back_days}日)"]
-
-    # 1. 上榜记录 — eastmoney datacenter direct HTTP
-    try:
-        data = _eastmoney_datacenter(
-            "RPT_DAILYBILLBOARD_DETAILSNEW",
-            filter_str=(
-                f"(TRADE_DATE>='{start_date_str}')"
-                f"(TRADE_DATE<='{trade_date}')"
-                f"(SECURITY_CODE=\"{code}\")"
-            ),
-            page_size=50,
-            sort_columns="TRADE_DATE",
-            sort_types="-1",
+    """Get dragon-tiger board event rows and optional seat details via Tushare."""
+    as_of_input = trade_date or datetime.now().strftime("%Y-%m-%d")
+    ts_code, valid_symbol = _dragon_tiger_ts_code(ticker)
+    if not valid_symbol:
+        return _dragon_tiger_short_message(
+            status="invalid_input",
+            symbol=ts_code,
+            as_of=str(as_of_input),
+            coverage="symbol_unresolved",
+            empty_reason="invalid_or_unresolved_ticker",
+            message="Invalid or unresolved A-share ticker for dragon-tiger event query.",
         )
-        if not data:
-            lines.append(f"\n近{look_back_days}日未上龙虎榜。")
-        else:
-            lines.append(f"\n## 上榜记录 ({len(data)} 次)")
-            lines.append("日期 | 原因 | 净买入(万) | 换手率")
-            for row in data:
-                net_buy = round((row.get("BILLBOARD_NET_AMT") or 0) / 10000, 1)
-                turnover = round(float(row.get("TURNOVERRATE") or 0), 2)
-                lines.append(
-                    f"  {str(row.get('TRADE_DATE', ''))[:10]} "
-                    f"| {row.get('EXPLANATION', '')} "
-                    f"| {net_buy:.0f} "
-                    f"| {turnover:.2f}%"
+
+    try:
+        as_of, start_date, query_dates = _dragon_tiger_query_dates(
+            as_of_input, look_back_days
+        )
+    except Exception:
+        return _dragon_tiger_short_message(
+            status="invalid_input",
+            symbol=ts_code,
+            as_of=str(as_of_input),
+            empty_reason="not_applicable",
+            message="Invalid date or lookback input for dragon-tiger event query.",
+        )
+
+    try:
+        from .tushare_client import get_tushare_client
+
+        client = get_tushare_client()
+        event_frames: list[pd.DataFrame] = []
+        technical_errors: list[str] = []
+
+        for query_date in query_dates:
+            response = client.call_api(
+                "top_list",
+                params={"trade_date": query_date},
+                fields=",".join(_DRAGON_TIGER_EVENT_FIELDS),
+                cache_key=f"top_list/{query_date}.json",
+                use_cache=False,
+            )
+            if not response.ok:
+                technical_errors.append(response.error or response.message or "")
+                continue
+            frame = _dragon_tiger_filter_frame(
+                response.data, _DRAGON_TIGER_EVENT_FIELDS, ts_code, as_of
+            )
+            if not frame.empty:
+                event_frames.append(frame)
+
+        if not event_frames:
+            if technical_errors:
+                error_type = _classify_data_source_error(technical_errors[0])
+                return _dragon_tiger_short_message(
+                    status="technical_error",
+                    symbol=ts_code,
+                    as_of=as_of,
+                    error_type=error_type,
+                    raw_error_suppressed=True,
+                    message="Data source request failed; raw technical details suppressed.",
                 )
-    except Exception as e:
-        lines.append(f"龙虎榜列表查询失败: {e}")
-
-    # 2. 最近上榜的买卖席位 — eastmoney datacenter direct HTTP
-    try:
-        if data:
-            latest_date = str(data[0].get("TRADE_DATE", ""))[:10]
-            lines.append(f"\n## 最近上榜席位明细 ({latest_date})")
-
-            # 买入席位
-            buy_data = _eastmoney_datacenter(
-                "RPT_BILLBOARD_DAILYDETAILSBUY",
-                filter_str=f"(TRADE_DATE='{latest_date}')(SECURITY_CODE=\"{code}\")",
-                page_size=10,
-                sort_columns="BUY",
-                sort_types="-1",
+            return _dragon_tiger_short_message(
+                status="no_event",
+                symbol=ts_code,
+                as_of=as_of,
+                trade_date="N/A",
+                empty_reason="no_event",
+                message=(
+                    "No dragon-tiger board event found for the requested symbol "
+                    "and lookback window."
+                ),
             )
-            if buy_data:
-                lines.append("\n### 买入席位 TOP5")
-                lines.append("营业部 | 买入(万) | 卖出(万) | 净额(万)")
-                for row in buy_data[:5]:
-                    buy_amt = round((row.get("BUY") or 0) / 10000, 1)
-                    sell_amt = round((row.get("SELL") or 0) / 10000, 1)
-                    net = round((row.get("NET") or 0) / 10000, 1)
-                    lines.append(
-                        f"  {row.get('OPERATEDEPT_NAME', '')} "
-                        f"| {buy_amt:.0f} | {sell_amt:.0f} | {net:.0f}"
-                    )
 
-            # 卖出席位
-            sell_data = _eastmoney_datacenter(
-                "RPT_BILLBOARD_DAILYDETAILSSELL",
-                filter_str=f"(TRADE_DATE='{latest_date}')(SECURITY_CODE=\"{code}\")",
-                page_size=10,
-                sort_columns="SELL",
-                sort_types="-1",
+        events_df = pd.concat(event_frames, ignore_index=True)
+        events_df = events_df.sort_values("trade_date", ascending=False).reset_index(drop=True)
+        event_dates = events_df["trade_date"].astype(str).drop_duplicates().tolist()
+        inst_frames: list[pd.DataFrame] = []
+        inst_errors: list[str] = []
+
+        for event_date in event_dates:
+            response = client.call_api(
+                "top_inst",
+                params={"trade_date": event_date},
+                fields=",".join(_DRAGON_TIGER_INST_FIELDS),
+                cache_key=f"top_inst/{event_date}.json",
+                use_cache=False,
             )
-            if sell_data:
-                lines.append("\n### 卖出席位 TOP5")
-                lines.append("营业部 | 买入(万) | 卖出(万) | 净额(万)")
-                for row in sell_data[:5]:
-                    buy_amt = round((row.get("BUY") or 0) / 10000, 1)
-                    sell_amt = round((row.get("SELL") or 0) / 10000, 1)
-                    net = round((row.get("NET") or 0) / 10000, 1)
-                    lines.append(
-                        f"  {row.get('OPERATEDEPT_NAME', '')} "
-                        f"| {buy_amt:.0f} | {sell_amt:.0f} | {net:.0f}"
-                    )
-    except Exception:
-        pass
-
-    # 3. 机构动向 — 从买卖席位明细筛选机构专用席位 (OPERATEDEPT_CODE="0")
-    try:
-        inst_buy = 0.0
-        inst_sell = 0.0
-        for detail, side in [(buy_data, "buy"), (sell_data, "sell")]:
-            for row in (detail or []):
-                if str(row.get("OPERATEDEPT_CODE", "")) == "0":
-                    if side == "buy":
-                        inst_buy += (row.get("BUY") or 0)
-                    else:
-                        inst_sell += (row.get("SELL") or 0)
-        if inst_buy > 0 or inst_sell > 0:
-            lines.append("\n## 机构动向")
-            lines.append(
-                f"  机构买入 {inst_buy/1e4:.0f} 万 "
-                f"| 卖出 {inst_sell/1e4:.0f} 万 "
-                f"| 净额 {(inst_buy - inst_sell)/1e4:.0f} 万"
+            if not response.ok:
+                inst_errors.append(response.error or response.message or "")
+                continue
+            inst_frame = _dragon_tiger_filter_frame(
+                response.data, _DRAGON_TIGER_INST_FIELDS, ts_code, as_of
             )
-    except Exception:
-        pass
+            if not inst_frame.empty:
+                inst_frames.append(inst_frame)
 
-    return "\n".join(lines)
+        inst_df = (
+            pd.concat(inst_frames, ignore_index=True)
+            .sort_values("trade_date", ascending=False)
+            .reset_index(drop=True)
+            if inst_frames
+            else pd.DataFrame()
+        )
+        detail_note = ""
+        status = "ok"
+        if inst_df.empty:
+            status = "partial_data"
+            detail_note = "seat/institution details unavailable"
+        elif inst_errors:
+            status = "partial_data"
+            detail_note = "some seat/institution detail dates unavailable"
+
+        return _format_dragon_tiger_output(
+            status=status,
+            ts_code=ts_code,
+            as_of=as_of,
+            start_date=start_date,
+            queried_dates=query_dates,
+            events_df=events_df,
+            inst_df=inst_df,
+            detail_note=detail_note,
+        )
+
+    except Exception as exc:
+        error_type = _classify_data_source_error(exc)
+        return _dragon_tiger_short_message(
+            status="technical_error",
+            symbol=ts_code,
+            as_of=as_of,
+            error_type=error_type,
+            raw_error_suppressed=True,
+            message="Data source request failed; raw technical details suppressed.",
+        )
 
 
 # ---------------------------------------------------------------------------
