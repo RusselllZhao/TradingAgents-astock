@@ -340,6 +340,12 @@ def _classify_data_source_error(error: Exception | str) -> str:
     """Classify a technical data-source error without exposing raw details."""
     text = str(error).lower()
 
+    if "rate" in text or "rate_limited" in text or "频率" in text:
+        return "rate_limited"
+    if any(key in text for key in ("permission", "denied", "权限", "积分", "token_missing")):
+        return "vendor_error"
+    if "tushare_upstream" in text:
+        return "vendor_error"
     if "proxy" in text or isinstance(error, _requests.exceptions.ProxyError):
         return "proxy_error"
     if "<html" in text or "<!doctype" in text or "html" in text:
@@ -1917,59 +1923,145 @@ def get_hot_stocks(
 
 # ---- 12. get_northbound_flow ----
 
+_NORTHBOUND_FLOW_FIELDS = [
+    "trade_date",
+    "hgt",
+    "sgt",
+    "north_money",
+    "south_money",
+]
 
-def _northbound_cache_path() -> str:
-    """Path to local CSV cache for northbound daily close snapshots."""
-    from .config import get_config
 
-    config = get_config()
-    cache_dir = config.get(
-        "data_cache_dir", os.path.expanduser("~/.tradingagents/cache")
+def _northbound_contract_header(
+    *,
+    status: str,
+    as_of: str,
+    trade_date: str,
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    notes: str = "",
+) -> str:
+    return _build_data_source_contract_header(
+        status=status,
+        source="Tushare moneyflow_hsgt",
+        data_type="northbound_flow",
+        query_target="market",
+        symbol="N/A",
+        as_of=as_of,
+        trade_date=trade_date,
+        unit="CNY million (Tushare moneyflow_hsgt raw fields)",
+        coverage="market_wide",
+        fallback="none",
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+        limitations="market-level flow only; no stock-level holding data included",
+        notes=notes,
     )
-    os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, "northbound_daily.csv")
 
 
-def _save_northbound_snapshot(date_str: str, hgt: float, sgt: float) -> None:
-    """Append today's northbound close to local CSV cache (dedup by date)."""
-    import csv
+def _northbound_short_message(
+    *,
+    status: str,
+    as_of: str,
+    trade_date: str = "N/A",
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    message: str,
+) -> str:
+    header = _northbound_contract_header(
+        status=status,
+        as_of=as_of,
+        trade_date=trade_date,
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+    )
+    return f"{header}\n\n{message}"
 
-    path = _northbound_cache_path()
-    existing: dict[str, tuple[str, str]] = {}
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            next(reader, None)
-            for row in reader:
-                if len(row) >= 3:
-                    existing[row[0]] = (row[1], row[2])
-    existing[date_str] = (f"{hgt:.2f}", f"{sgt:.2f}")
-    sorted_dates = sorted(existing.keys())
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["date", "hgt", "sgt"])
-        for d in sorted_dates:
-            writer.writerow([d, existing[d][0], existing[d][1]])
+
+def _northbound_query_window(as_of: str, include_history: bool) -> tuple[str, str, str]:
+    as_of_dt = pd.to_datetime(as_of).normalize()
+    lookback_days = 45 if include_history else 10
+    start_date = (as_of_dt - pd.Timedelta(days=lookback_days)).strftime("%Y%m%d")
+    end_date = as_of_dt.strftime("%Y%m%d")
+    return as_of_dt.strftime("%Y-%m-%d"), start_date, end_date
 
 
-def _load_northbound_history(n: int = 20) -> list[tuple[str, float, float]]:
-    """Load last N days of northbound close data from local cache."""
-    import csv
+def _northbound_flow_frame(data: object, as_of: str, include_history: bool) -> pd.DataFrame:
+    df = _tushare_data_to_frame(data)
+    if df.empty or "trade_date" not in df.columns:
+        return pd.DataFrame()
 
-    path = _northbound_cache_path()
-    if not os.path.exists(path):
-        return []
-    rows: list[tuple[str, float, float]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        next(reader, None)
-        for row in reader:
-            if len(row) >= 3:
-                try:
-                    rows.append((row[0], float(row[1]), float(row[2])))
-                except ValueError:
-                    continue
-    return rows[-n:]
+    as_of_compact = as_of.replace("-", "")
+    df = df.copy()
+    df["trade_date"] = df["trade_date"].astype(str).str.replace("-", "", regex=False)
+    df = df[df["trade_date"].str.len().eq(8)]
+    df = df[df["trade_date"] <= as_of_compact]
+    if df.empty:
+        return df
+
+    limit = 20 if include_history else 1
+    df = df.sort_values("trade_date", ascending=False).head(limit)
+    return df.sort_values("trade_date").reset_index(drop=True)
+
+
+def _markdown_table(df: pd.DataFrame, columns: list[str]) -> str:
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for _, row in df.iterrows():
+        values: list[str] = []
+        for column in columns:
+            value = row.get(column, "")
+            if pd.isna(value):
+                values.append("")
+            elif isinstance(value, float):
+                values.append(f"{value:.2f}")
+            else:
+                values.append(str(value))
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
+def _format_northbound_flow_output(
+    as_of: str,
+    start_date: str,
+    end_date: str,
+    df: pd.DataFrame,
+    include_history: bool,
+) -> str:
+    trade_dates = df["trade_date"].astype(str).tolist()
+    trade_date = trade_dates[-1] if trade_dates else "N/A"
+    missing = [field for field in _NORTHBOUND_FLOW_FIELDS if field not in df.columns]
+    if missing:
+        return _northbound_short_message(
+            status="technical_error",
+            as_of=as_of,
+            trade_date=trade_date,
+            error_type="unexpected_schema",
+            raw_error_suppressed=True,
+            message="Data source request failed; raw technical details suppressed.",
+        )
+
+    header = _northbound_contract_header(
+        status="ok",
+        as_of=as_of,
+        trade_date=trade_date,
+        notes=(
+            f"query_window={start_date}-{end_date}; "
+            f"rows={len(df)}; include_history={str(include_history).lower()}"
+        ),
+    )
+    lines = [
+        "# Northbound / Southbound Capital Flow",
+        "",
+        _markdown_table(df, _NORTHBOUND_FLOW_FIELDS),
+    ]
+    return f"{header}\n\n" + "\n".join(lines)
 
 
 def get_northbound_flow(
@@ -1978,100 +2070,63 @@ def get_northbound_flow(
         bool, "Include historical daily data (last 20 trading days)"
     ] = False,
 ) -> str:
-    """Get northbound capital flow (沪深股通) from 同花顺 hsgtApi.
-
-    Realtime: minute-level cumulative net buying for HGT(沪股通) + SGT(深股通).
-    History: self-cached daily close snapshots (upstream APIs stopped updating
-    northbound history since 2024-08).
-    """
-    import requests
-
-    hsgt_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "Chrome/117.0.0.0 Safari/537.36"
-        ),
-        "Host": "data.hexin.cn",
-        "Referer": "https://data.hexin.cn/",
-    }
-
-    lines = [
-        f"# Northbound Capital Flow ({curr_date})",
-        "# Source: 同花顺 hsgtApi (沪深股通) + local cache",
-        "",
-    ]
-
-    hgt_close = 0.0
-    sgt_close = 0.0
-    got_realtime = False
+    """Get market-level northbound/southbound capital flow via Tushare."""
+    as_of_input = curr_date or datetime.now().strftime("%Y-%m-%d")
+    try:
+        as_of, start_date, end_date = _northbound_query_window(
+            as_of_input, include_history
+        )
+    except Exception:
+        return _northbound_short_message(
+            status="invalid_input",
+            as_of=str(as_of_input),
+            empty_reason="invalid_or_unresolved_ticker",
+            message="Invalid date input for northbound flow query.",
+        )
 
     try:
-        url_rt = "https://data.hexin.cn/market/hsgtApi/method/dayChart/"
-        r = requests.get(url_rt, headers=hsgt_headers, timeout=10)
-        d = r.json()
+        from .tushare_client import get_tushare_client
 
-        times = d.get("time", [])
-        hgt = d.get("hgt", [])
-        sgt = d.get("sgt", [])
-
-        if times:
-            lines.append("## Realtime (cumulative net buying, 亿元)")
-            n = len(times)
-            start_idx = max(0, n - 10)
-            for i in range(start_idx, n):
-                t = times[i]
-                h = hgt[i] if i < len(hgt) else "N/A"
-                s = sgt[i] if i < len(sgt) else "N/A"
-                lines.append(f"  {t}: HGT={h} SGT={s}")
-
-            hgt_close = float(hgt[-1]) if hgt else 0
-            sgt_close = float(sgt[-1]) if sgt else 0
-            total = hgt_close + sgt_close
-            lines.append(
-                f"\nClose: HGT(沪股通)={hgt_close:.2f}亿 "
-                f"SGT(深股通)={sgt_close:.2f}亿 "
-                f"Total={total:.2f}亿"
+        client = get_tushare_client()
+        response = client.call_api(
+            "moneyflow_hsgt",
+            params={"start_date": start_date, "end_date": end_date},
+            fields=",".join(_NORTHBOUND_FLOW_FIELDS),
+            cache_key=f"moneyflow_hsgt/{start_date}_{end_date}.json",
+            use_cache=False,
+        )
+        if not response.ok:
+            error_type = _classify_data_source_error(response.error or response.message or "")
+            return _northbound_short_message(
+                status="technical_error",
+                as_of=as_of,
+                error_type=error_type,
+                raw_error_suppressed=True,
+                message="Data source request failed; raw technical details suppressed.",
             )
-            if total > 0:
-                lines.append("Signal: Net northbound INFLOW (bullish)")
-            elif total < 0:
-                lines.append("Signal: Net northbound OUTFLOW (bearish)")
-            got_realtime = True
-        else:
-            lines.append("No realtime data (non-trading hours or holiday)")
 
-        if got_realtime:
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            _save_northbound_snapshot(today_str, hgt_close, sgt_close)
+        df = _northbound_flow_frame(response.data, as_of, include_history)
+        if df.empty:
+            return _northbound_short_message(
+                status="empty",
+                as_of=as_of,
+                empty_reason="source_empty",
+                message="Tushare moneyflow_hsgt returned no rows for the query window.",
+            )
 
-        if include_history:
-            history = _load_northbound_history(20)
-            if history:
-                lines.append("\n## Historical Daily Close (local cache, 亿元)")
-                lines.append("Date       | HGT(沪股通) | SGT(深股通) | Total")
-                for date, h, s in history:
-                    lines.append(f"  {date}: HGT={h:.2f} SGT={s:.2f} Total={h + s:.2f}")
-                avg_total = sum(h + s for _, h, s in history) / len(history)
-                lines.append(
-                    f"\n{len(history)}-day avg net flow: {avg_total:.2f}亿"
-                )
-                if got_realtime:
-                    today_total = hgt_close + sgt_close
-                    diff = today_total - avg_total
-                    lines.append(
-                        f"Today vs avg: {'+' if diff >= 0 else ''}{diff:.2f}亿 "
-                        f"({'above' if diff >= 0 else 'below'} average)"
-                    )
-            else:
-                lines.append(
-                    "\n## Historical Daily: No cached data yet. "
-                    "History accumulates automatically with each call."
-                )
+        return _format_northbound_flow_output(
+            as_of, start_date, end_date, df, include_history
+        )
 
-        return "\n".join(lines)
-
-    except Exception as e:
-        return f"Error fetching northbound flow: {str(e)}"
+    except Exception as exc:
+        error_type = _classify_data_source_error(exc)
+        return _northbound_short_message(
+            status="technical_error",
+            as_of=as_of,
+            error_type=error_type,
+            raw_error_suppressed=True,
+            message="Data source request failed; raw technical details suppressed.",
+        )
 
 
 # ---------------------------------------------------------------------------
