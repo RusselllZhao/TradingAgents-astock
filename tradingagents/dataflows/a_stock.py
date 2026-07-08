@@ -1439,48 +1439,120 @@ def get_news(
 
 # ---- 8. get_global_news ----
 
+_GLOBAL_NEWS_TUSHARE_FIELDS = [
+    "title",
+    "pub_time",
+    "src",
+]
 
-def get_global_news(
-    curr_date: Annotated[str, "Current date yyyy-mm-dd"],
-    look_back_days: Annotated[int, "Days to look back"] = 7,
-    limit: Annotated[int, "Max articles"] = 10,
+
+def _global_news_contract_header(
+    *,
+    status: str,
+    as_of: str,
+    trade_date: str,
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    notes: str = "",
 ) -> str:
-    """Get China/global financial news via direct HTTP (CLS + Eastmoney)."""
-    start_dt = datetime.strptime(curr_date, "%Y-%m-%d") - relativedelta(
-        days=look_back_days
+    return _build_data_source_contract_header(
+        status=status,
+        source="CLS + Eastmoney 7x24 + Tushare major_news",
+        data_type="global_news",
+        query_target="market",
+        symbol="N/A",
+        as_of=as_of,
+        trade_date=trade_date,
+        unit="news_items",
+        coverage="market_wide",
+        fallback="mixed_sources",
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+        limitations="market/global/macro news scope; no symbol query",
+        notes=notes,
     )
-    start_date = start_dt.strftime("%Y-%m-%d")
 
-    all_news: list[dict] = []
 
-    # Source 1: CLS wire (财联社快讯) — direct HTTP
+def _global_news_short_message(
+    *,
+    status: str,
+    as_of: str,
+    trade_date: str = "N/A",
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    message: str,
+) -> str:
+    header = _global_news_contract_header(
+        status=status,
+        as_of=as_of,
+        trade_date=trade_date,
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+    )
+    return f"{header}\n\n{message}"
+
+
+def _global_news_window(curr_date: str, look_back_days: int) -> tuple[str, str]:
+    as_of_dt = pd.to_datetime(curr_date).normalize()
+    days = max(0, int(look_back_days))
+    start_dt = as_of_dt - pd.Timedelta(days=days)
+    return as_of_dt.strftime("%Y-%m-%d"), start_dt.strftime("%Y-%m-%d")
+
+
+def _global_news_markdown_table(rows: list[dict], limit: int) -> str:
+    columns = ["pub_time", "source", "title", "summary"]
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for row in rows[:limit]:
+        values: list[str] = []
+        for column in columns:
+            text = str(row.get(column, "") or "").replace("\n", " ").replace("|", "/")
+            if len(text) > 220:
+                text = text[:217] + "..."
+            values.append(text)
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
+def _fetch_cls_market_news(limit: int) -> tuple[list[dict], str]:
     try:
         cls_url = "https://www.cls.cn/nodeapi/telegraphList"
         cls_params = {"rn": str(limit), "page": "1"}
         cls_headers = {"User-Agent": _UA, "Referer": "https://www.cls.cn/"}
         r_cls = _requests.get(cls_url, params=cls_params, headers=cls_headers, timeout=10)
+        r_cls.raise_for_status()
         d_cls = r_cls.json()
+        rows: list[dict] = []
         for item in d_cls.get("data", {}).get("roll_data", []):
             title = item.get("title", "") or item.get("brief", "")
             content = item.get("content", "") or item.get("brief", "")
             ctime = item.get("ctime", "")
-            # ctime is unix timestamp
             pub_time = ""
             if ctime:
                 try:
                     pub_time = datetime.fromtimestamp(int(ctime)).strftime("%Y-%m-%d %H:%M")
                 except (ValueError, TypeError, OSError):
                     pub_time = str(ctime)
-            all_news.append({
-                "title": title,
-                "content": content,
-                "time": pub_time,
-                "source": "CLS Wire",
-            })
-    except Exception as e:
-        logger.warning("CLS news fetch failed: %s", e)
+            if title:
+                rows.append({
+                    "title": title,
+                    "summary": content,
+                    "pub_time": pub_time,
+                    "source": "CLS Wire",
+                })
+        return rows, ""
+    except Exception as exc:
+        logger.debug("CLS news fetch failed")
+        return [], _classify_data_source_error(exc)
 
-    # Source 2: Eastmoney global (东财7x24资讯) — direct HTTP
+
+def _fetch_eastmoney_market_news(limit: int) -> tuple[list[dict], str]:
     try:
         em_url = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
         em_params = {
@@ -1493,46 +1565,195 @@ def get_global_news(
         }
         em_headers = {"User-Agent": _UA, "Referer": "https://kuaixun.eastmoney.com/"}
         r_em = _em_get(em_url, params=em_params, headers=em_headers, timeout=10)
+        r_em.raise_for_status()
         d_em = r_em.json()
+        rows: list[dict] = []
         for item in d_em.get("data", {}).get("fastNewsList", []):
             title = item.get("title", "")
-            summary = item.get("summary", "")[:200]
-            pub_time = item.get("showTime", "")
-            all_news.append({
-                "title": title,
-                "content": summary,
-                "time": pub_time,
-                "source": "Eastmoney Global",
-            })
-    except Exception as e:
-        logger.warning("Eastmoney global news fetch failed: %s", e)
+            if title:
+                rows.append({
+                    "title": title,
+                    "summary": item.get("summary", ""),
+                    "pub_time": item.get("showTime", ""),
+                    "source": "Eastmoney 7x24",
+                })
+        return rows, ""
+    except Exception as exc:
+        logger.debug("Eastmoney global news fetch failed")
+        return [], _classify_data_source_error(exc)
 
-    if not all_news:
-        return f"No global news found for {curr_date}"
 
-    # Deduplicate by title
+def _fetch_tushare_major_news(
+    as_of: str,
+    start_date: str,
+    limit: int,
+) -> tuple[list[dict], str]:
+    try:
+        from .tushare_client import get_tushare_client
+
+        client = get_tushare_client()
+        response = client.call_api(
+            "major_news",
+            params={
+                "start_date": f"{start_date} 00:00:00",
+                "end_date": f"{as_of} 23:59:59",
+            },
+            fields=",".join(_GLOBAL_NEWS_TUSHARE_FIELDS),
+            cache_key=f"major_news/{start_date}_{as_of}.json",
+            use_cache=False,
+        )
+        if not response.ok:
+            return [], _classify_data_source_error(response.error or response.message or "")
+
+        df = _tushare_data_to_frame(response.data)
+        if df.empty:
+            return [], ""
+        rows: list[dict] = []
+        for _, row in df.head(limit).iterrows():
+            title = row.get("title", "")
+            if title:
+                rows.append({
+                    "title": title,
+                    "summary": "",
+                    "pub_time": row.get("pub_time", ""),
+                    "source": row.get("src", "") or "Tushare major_news",
+                })
+        return rows, ""
+    except Exception as exc:
+        return [], _classify_data_source_error(exc)
+
+
+def _dedupe_global_news(rows: list[dict]) -> list[dict]:
     seen: set[str] = set()
     unique: list[dict] = []
-    for n in all_news:
-        if n["title"] not in seen:
-            seen.add(n["title"])
-            unique.append(n)
+    for row in rows:
+        title = str(row.get("title", "")).strip()
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        unique.append(row)
+    return unique
 
-    news_str = ""
-    for n in unique[:limit]:
-        news_str += f"### {n['title']} (source: {n['source']})\n"
-        if n.get("content"):
-            snippet = (
-                n["content"][:300] + "..."
-                if len(n["content"]) > 300
-                else n["content"]
-            )
-            news_str += f"{snippet}\n"
-        news_str += "\n"
 
-    return (
-        f"## China & Global Market News, from {start_date} to {curr_date}:\n\n"
-        + news_str
+def _format_global_news_output(
+    *,
+    status: str,
+    as_of: str,
+    start_date: str,
+    cls_em_rows: list[dict],
+    tushare_rows: list[dict],
+    unavailable_sources: list[str],
+    raw_error_suppressed: bool,
+    limit: int,
+) -> str:
+    pub_dates = [
+        str(row.get("pub_time", ""))[:10]
+        for row in cls_em_rows + tushare_rows
+        if str(row.get("pub_time", ""))[:10]
+    ]
+    trade_date = max(pub_dates) if pub_dates else "N/A"
+    available_sources = []
+    if cls_em_rows:
+        available_sources.append("CLS/Eastmoney")
+    if tushare_rows:
+        available_sources.append("Tushare major_news")
+    notes = (
+        f"query_window={start_date}-{as_of}; "
+        f"available_sources={','.join(available_sources) if available_sources else 'none'}; "
+        f"unavailable_sources={','.join(unavailable_sources) if unavailable_sources else 'none'}"
+    )
+    header = _global_news_contract_header(
+        status=status,
+        as_of=as_of,
+        trade_date=trade_date,
+        raw_error_suppressed=raw_error_suppressed,
+        notes=notes,
+    )
+    lines = ["# Global / Market News", ""]
+    if cls_em_rows:
+        lines.extend([
+            "## CLS / Eastmoney Market News",
+            "",
+            _global_news_markdown_table(cls_em_rows, limit),
+            "",
+        ])
+    if tushare_rows:
+        lines.extend([
+            "## Tushare Major News",
+            "",
+            _global_news_markdown_table(tushare_rows, limit),
+            "",
+        ])
+    return f"{header}\n\n" + "\n".join(lines).rstrip()
+
+
+def get_global_news(
+    curr_date: Annotated[str, "Current date yyyy-mm-dd"],
+    look_back_days: Annotated[int, "Days to look back"] = 7,
+    limit: Annotated[int, "Max articles"] = 10,
+) -> str:
+    """Get market/global financial news via CLS, Eastmoney, and Tushare."""
+    try:
+        as_of, start_date = _global_news_window(curr_date, look_back_days)
+    except Exception:
+        as_of = str(curr_date)
+        return _global_news_short_message(
+            status="technical_error",
+            as_of=as_of,
+            error_type="parse_error",
+            raw_error_suppressed=True,
+            message="Data source request failed; raw technical details suppressed.",
+        )
+
+    cls_rows, cls_error = _fetch_cls_market_news(limit)
+    em_rows, em_error = _fetch_eastmoney_market_news(limit)
+    tushare_rows, tushare_error = _fetch_tushare_major_news(as_of, start_date, limit)
+
+    cls_em_rows = _dedupe_global_news(cls_rows + em_rows)
+    tushare_rows = _dedupe_global_news(tushare_rows)
+    unavailable_sources = []
+    source_errors = []
+    if cls_error:
+        unavailable_sources.append("CLS")
+        source_errors.append(cls_error)
+    if em_error:
+        unavailable_sources.append("Eastmoney 7x24")
+        source_errors.append(em_error)
+    if tushare_error:
+        unavailable_sources.append("Tushare major_news")
+        source_errors.append(tushare_error)
+
+    if cls_em_rows or tushare_rows:
+        status = "partial_data" if unavailable_sources else "ok"
+        return _format_global_news_output(
+            status=status,
+            as_of=as_of,
+            start_date=start_date,
+            cls_em_rows=cls_em_rows,
+            tushare_rows=tushare_rows,
+            unavailable_sources=unavailable_sources,
+            raw_error_suppressed=bool(unavailable_sources),
+            limit=limit,
+        )
+
+    if source_errors:
+        error_type = source_errors[0] if len(set(source_errors)) == 1 else "mixed_source_error"
+        return _global_news_short_message(
+            status="technical_error",
+            as_of=as_of,
+            error_type=error_type,
+            raw_error_suppressed=True,
+            message="Data source request failed; raw technical details suppressed.",
+        )
+
+    return _global_news_short_message(
+        status="empty",
+        as_of=as_of,
+        empty_reason="source_empty",
+        message=(
+            "Global/market news sources returned no rows for the requested "
+            "date window."
+        ),
     )
 
 
