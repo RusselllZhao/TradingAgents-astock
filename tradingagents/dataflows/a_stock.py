@@ -288,6 +288,77 @@ def _em_get(url, params=None, headers=None, timeout=15, **kwargs):
         _em_last_call[0] = time.time()
 
 
+# ---------------------------------------------------------------------------
+# String-compatible data source contract helpers
+# ---------------------------------------------------------------------------
+
+def _build_data_source_contract_header(
+    *,
+    status: str,
+    source: str,
+    data_type: str,
+    query_target: str,
+    symbol: str,
+    as_of: str,
+    trade_date: str,
+    unit: str,
+    coverage: str,
+    fallback: str = "none",
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    limitations: str = "",
+    notes: str = "",
+) -> str:
+    """Build a stable Agent-visible string header for dataflow outputs."""
+    lines = [
+        "# Data Source Contract",
+        f"status: {status}",
+        f"source: {source}",
+        f"data_type: {data_type}",
+        f"query_target: {query_target}",
+        f"symbol: {symbol}",
+        f"as_of: {as_of}",
+        f"trade_date: {trade_date}",
+        f"unit: {unit}",
+        f"coverage: {coverage}",
+        f"fallback: {fallback}",
+        f"empty_reason: {empty_reason}",
+        f"error_type: {error_type}",
+        f"raw_error_suppressed: {str(raw_error_suppressed).lower()}",
+    ]
+    if limitations:
+        lines.append(f"limitations: {limitations}")
+    if notes:
+        lines.append(f"notes: {notes}")
+    lines.append("")
+    lines.append("## Data")
+    return "\n".join(lines)
+
+
+def _classify_data_source_error(error: Exception | str) -> str:
+    """Classify a technical data-source error without exposing raw details."""
+    text = str(error).lower()
+
+    if "proxy" in text or isinstance(error, _requests.exceptions.ProxyError):
+        return "proxy_error"
+    if "<html" in text or "<!doctype" in text or "html" in text:
+        return "html_response"
+    if "timeout" in text or isinstance(error, _requests.exceptions.Timeout):
+        return "timeout"
+    if isinstance(error, _requests.exceptions.ConnectionError):
+        return "network_error"
+    if isinstance(error, _requests.exceptions.HTTPError):
+        return "vendor_error"
+    if "schema" in text or "missing" in text or "unexpected" in text:
+        return "unexpected_schema"
+    if isinstance(error, (ValueError, KeyError, TypeError)):
+        return "parse_error"
+    if "status code" in text or "resultcode" in text or "vendor" in text:
+        return "vendor_error"
+    return "unknown"
+
+
 def _eastmoney_datacenter(
     report_name: str,
     columns: str = "ALL",
@@ -2596,19 +2667,28 @@ def get_industry_comparison(
     trade_date: str,
     top_n: int = 20,
 ) -> str:
-    """Get industry sector performance comparison.
+    """Get Eastmoney all-market industry ranking.
 
     Args:
-        ticker: 6-digit A-share code (used to identify relevant sector)
+        ticker: 6-digit A-share code. The current implementation keeps this
+            symbol in the contract header but does not resolve its industry.
         trade_date: YYYY-MM-DD
         top_n: number of top/bottom industries to show (default 20)
 
     Returns:
-        Formatted text with sector performance ranking, highlighting
-        the sector the target stock belongs to.
+        String-compatible contract header plus industry ranking body.
     """
     code = safe_ticker_component(ticker)
-    lines = [f"# 行业横向对比 | {code} | {trade_date}"]
+    source = "Eastmoney push2"
+    data_type = "industry_ranking"
+    query_target = "market"
+    coverage = "market_wide"
+    unit = "pct_change=percent; count=stocks; rank=ordinal"
+    limitations = "target stock industry is not resolved by current implementation"
+    notes = (
+        "function requested industry comparison; current body is "
+        "all-market industry ranking"
+    )
 
     # 东财 push2 行业板块排名 (direct HTTP, replaces 同花顺 which has 401)
     try:
@@ -2624,10 +2704,14 @@ def get_industry_comparison(
             "fields": "f2,f3,f4,f12,f13,f14,f104,f105,f128,f136,f140,f141,f207",
         }
         r = _em_get(url, params=params, timeout=15)
+        if "<html" in r.text.lower() or "<!doctype" in r.text.lower():
+            raise RuntimeError("html_response")
+        r.raise_for_status()
         d = r.json()
         items = d.get("data", {}).get("diff", [])
 
         if items:
+            lines = [f"# 行业排名 | {code} | {trade_date}"]
             lines.append(
                 f"\n## 全行业表现 (东财 {len(items)} 个行业)"
             )
@@ -2650,9 +2734,67 @@ def get_industry_comparison(
                 if i >= top_n * 2 - 1:
                     lines.append(f"  ... (showing top/bottom {top_n})")
                     break
+            header = _build_data_source_contract_header(
+                status="ok",
+                source=source,
+                data_type=data_type,
+                query_target=query_target,
+                symbol=code,
+                as_of=trade_date,
+                trade_date=trade_date,
+                unit=unit,
+                coverage=coverage,
+                fallback="none",
+                empty_reason="none",
+                error_type="none",
+                raw_error_suppressed=False,
+                limitations=limitations,
+                notes=notes,
+            )
+            return f"{header}\n\n" + "\n".join(lines)
         else:
-            lines.append("行业数据获取为空。")
+            header = _build_data_source_contract_header(
+                status="empty",
+                source=source,
+                data_type=data_type,
+                query_target=query_target,
+                symbol=code,
+                as_of=trade_date,
+                trade_date=trade_date,
+                unit=unit,
+                coverage=coverage,
+                fallback="none",
+                empty_reason="source_empty",
+                error_type="none",
+                raw_error_suppressed=False,
+                limitations=limitations,
+                notes=notes,
+            )
+            return f"{header}\n\nNo industry ranking rows returned for the requested date."
     except Exception as e:
-        lines.append(f"行业对比查询失败: {e}")
-
-    return "\n".join(lines)
+        error_type = _classify_data_source_error(e)
+        logger.warning(
+            "Industry comparison source failed for %s; raw technical details suppressed",
+            code,
+        )
+        header = _build_data_source_contract_header(
+            status="technical_error",
+            source=source,
+            data_type=data_type,
+            query_target=query_target,
+            symbol=code,
+            as_of=trade_date,
+            trade_date=trade_date,
+            unit=unit,
+            coverage=coverage,
+            fallback="none",
+            empty_reason="none",
+            error_type=error_type,
+            raw_error_suppressed=True,
+            limitations=limitations,
+            notes=notes,
+        )
+        return (
+            f"{header}\n\n"
+            "Data source request failed; raw technical details suppressed."
+        )
