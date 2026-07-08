@@ -2129,88 +2129,239 @@ def get_northbound_flow(
         )
 
 
-# ---------------------------------------------------------------------------
-# Baidu PAE (百度股市通) helpers
-# ---------------------------------------------------------------------------
-
-_BAIDU_PAE_HEADERS = {
-    "Host": "finance.pae.baidu.com",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) "
-        "Gecko/20100101 Firefox/110.0"
-    ),
-    "Accept": "application/vnd.finance-web.v1+json",
-    "Origin": "https://gushitong.baidu.com",
-    "Referer": "https://gushitong.baidu.com/",
-}
-
-
 # ---- 13. get_concept_blocks ----
+
+_CONCEPT_BLOCK_FIELDS = [
+    "ts_code",
+    "trade_date",
+    "name",
+    "theme_code",
+    "industry_code",
+    "industry",
+    "reason",
+    "hot_num",
+]
+
+
+def _concept_blocks_contract_header(
+    *,
+    status: str,
+    symbol: str,
+    as_of: str,
+    trade_date: str,
+    coverage: str = "individual_stock",
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    notes: str = "",
+) -> str:
+    return _build_data_source_contract_header(
+        status=status,
+        source="Tushare dc_concept_cons",
+        data_type="concept_blocks",
+        query_target="stock",
+        symbol=symbol,
+        as_of=as_of,
+        trade_date=trade_date,
+        unit="membership rows; hot_num is raw Tushare field",
+        coverage=coverage,
+        fallback="none",
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+        limitations="stock concept membership only; no board-level market data included",
+        notes=notes,
+    )
+
+
+def _concept_blocks_short_message(
+    *,
+    status: str,
+    symbol: str,
+    as_of: str,
+    trade_date: str = "N/A",
+    coverage: str = "individual_stock",
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    message: str,
+) -> str:
+    header = _concept_blocks_contract_header(
+        status=status,
+        symbol=symbol,
+        as_of=as_of,
+        trade_date=trade_date,
+        coverage=coverage,
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+    )
+    return f"{header}\n\n{message}"
+
+
+def _concept_blocks_ts_code(ticker: str) -> tuple[str, bool]:
+    try:
+        code = _normalize_ticker(str(ticker))
+    except Exception:
+        return str(ticker or "N/A"), False
+    if not _re.fullmatch(r"\d{6}", code):
+        return code or "N/A", False
+    return _tushare_ts_code(code), True
+
+
+def _concept_blocks_query_window(as_of: str) -> tuple[str, str, str]:
+    as_of_dt = pd.to_datetime(as_of).normalize()
+    start_date = (as_of_dt - pd.Timedelta(days=30)).strftime("%Y%m%d")
+    end_date = as_of_dt.strftime("%Y%m%d")
+    return as_of_dt.strftime("%Y-%m-%d"), start_date, end_date
+
+
+def _concept_blocks_frame(data: object, ts_code: str, as_of: str) -> pd.DataFrame:
+    df = _tushare_data_to_frame(data)
+    if df.empty:
+        return df
+    if "ts_code" not in df.columns or "trade_date" not in df.columns:
+        raise ValueError("unexpected_schema: dc_concept_cons missing ts_code/trade_date")
+
+    as_of_compact = as_of.replace("-", "")
+    df = df.copy()
+    df["ts_code"] = df["ts_code"].astype(str).str.upper()
+    df["trade_date"] = df["trade_date"].astype(str).str.replace("-", "", regex=False)
+    df = df[(df["ts_code"] == ts_code.upper()) & df["trade_date"].str.len().eq(8)]
+    df = df[df["trade_date"] <= as_of_compact]
+    if df.empty:
+        return df
+
+    latest_trade_date = df["trade_date"].max()
+    df = df[df["trade_date"] == latest_trade_date]
+    available_columns = [field for field in _CONCEPT_BLOCK_FIELDS if field in df.columns]
+    df = df[available_columns]
+    sort_columns = [column for column in ("hot_num", "name") if column in available_columns]
+    if sort_columns:
+        df = df.sort_values(sort_columns)
+    return df.reset_index(drop=True)
+
+
+def _concept_blocks_markdown_table(df: pd.DataFrame, columns: list[str]) -> str:
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for _, row in df.iterrows():
+        values: list[str] = []
+        for column in columns:
+            value = row.get(column, "")
+            if pd.isna(value):
+                values.append("")
+            elif isinstance(value, float):
+                values.append(f"{value:.2f}")
+            else:
+                text = str(value).replace("\n", " ").replace("|", "/")
+                if len(text) > 160:
+                    text = text[:157] + "..."
+                values.append(text)
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
+def _format_concept_blocks_output(
+    ts_code: str,
+    as_of: str,
+    start_date: str,
+    end_date: str,
+    df: pd.DataFrame,
+) -> str:
+    columns = [field for field in _CONCEPT_BLOCK_FIELDS if field in df.columns]
+    trade_date = str(df["trade_date"].iloc[0]) if "trade_date" in df.columns else "N/A"
+    header = _concept_blocks_contract_header(
+        status="ok",
+        symbol=ts_code,
+        as_of=as_of,
+        trade_date=trade_date,
+        notes=f"query_window={start_date}-{end_date}; rows={len(df)}",
+    )
+    lines = [
+        "# Stock Concept Membership",
+        "",
+        _concept_blocks_markdown_table(df, columns),
+    ]
+    return f"{header}\n\n" + "\n".join(lines)
 
 
 def get_concept_blocks(
     ticker: Annotated[str, "A-stock code (e.g. 688017)"],
 ) -> str:
-    """Get concept/sector/region blocks that a stock belongs to (百度股市通).
+    """Get stock-to-concept membership via Tushare dc_concept_cons."""
+    as_of_input = datetime.now().strftime("%Y-%m-%d")
+    try:
+        as_of, start_date, end_date = _concept_blocks_query_window(as_of_input)
+    except Exception:
+        as_of = as_of_input
+        start_date = "N/A"
+        end_date = "N/A"
 
-    Returns industry classification (申万), concept themes, and region.
-    Each block includes current day's change percentage.
-    """
-    import requests
-
-    code = _normalize_ticker(ticker)
+    ts_code, valid_symbol = _concept_blocks_ts_code(ticker)
+    if not valid_symbol:
+        return _concept_blocks_short_message(
+            status="invalid_input",
+            symbol=ts_code,
+            as_of=as_of,
+            coverage="symbol_unresolved",
+            empty_reason="invalid_or_unresolved_ticker",
+            message="Invalid or unresolved A-share ticker for concept membership query.",
+        )
 
     try:
-        url = (
-            "https://finance.pae.baidu.com/api/getrelatedblock"
-            f'?stock=[{{"code":"{code}","market":"ab","type":"stock"}}]'
-            "&finClientType=pc"
-        )
-        r = requests.get(url, headers=_BAIDU_PAE_HEADERS, timeout=10)
-        d = r.json()
+        from .tushare_client import get_tushare_client
 
-        if str(d.get("ResultCode", -1)) != "0":
-            return (
-                f"Baidu PAE error: ResultCode={d.get('ResultCode')} "
-                f"{d.get('ResultMsg', '')}"
+        client = get_tushare_client()
+        response = client.call_api(
+            "dc_concept_cons",
+            params={
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+            fields=",".join(_CONCEPT_BLOCK_FIELDS),
+            cache_key=f"dc_concept_cons/{ts_code}_{start_date}_{end_date}.json",
+            use_cache=False,
+        )
+        if not response.ok:
+            error_type = _classify_data_source_error(response.error or response.message or "")
+            return _concept_blocks_short_message(
+                status="technical_error",
+                symbol=ts_code,
+                as_of=as_of,
+                error_type=error_type,
+                raw_error_suppressed=True,
+                message="Data source request failed; raw technical details suppressed.",
             )
 
-        result = d.get("Result", {})
-        categories = result.get(code, [])
-        if not categories:
-            return f"No concept/block data for {code}"
+        df = _concept_blocks_frame(response.data, ts_code, as_of)
+        if df.empty:
+            return _concept_blocks_short_message(
+                status="empty",
+                symbol=ts_code,
+                as_of=as_of,
+                empty_reason="no_coverage",
+                message=(
+                    "Tushare dc_concept_cons returned no concept membership rows "
+                    "for the requested stock and query window."
+                ),
+            )
 
-        lines = [
-            f"# Concept & Sector Blocks for {code} (A-stock)",
-            f"# Source: 百度股市通 (Baidu PAE)",
-            f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            "",
-        ]
+        return _format_concept_blocks_output(ts_code, as_of, start_date, end_date, df)
 
-        concept_names: list[str] = []
-
-        for cat in categories:
-            cat_name = cat.get("name", "")
-            items = cat.get("list", [])
-            if not items:
-                continue
-            lines.append(f"## {cat_name}")
-            for item in items:
-                name = item.get("name", "")
-                ratio = item.get("ratio", "")
-                desc = item.get("describe", "")
-                suffix = f" ({desc})" if desc else ""
-                lines.append(f"  {name}{suffix}: {ratio}")
-                if cat_name == "概念":
-                    concept_names.append(name)
-
-        if concept_names:
-            lines.append(f"\nConcept tags: {' / '.join(concept_names)}")
-
-        return "\n".join(lines)
-
-    except Exception as e:
-        return f"Error fetching concept blocks for {code}: {str(e)}"
+    except Exception as exc:
+        error_type = _classify_data_source_error(exc)
+        return _concept_blocks_short_message(
+            status="technical_error",
+            symbol=ts_code,
+            as_of=as_of,
+            error_type=error_type,
+            raw_error_suppressed=True,
+            message="Data source request failed; raw technical details suppressed.",
+        )
 
 
 # ---- 14. get_fund_flow ----
