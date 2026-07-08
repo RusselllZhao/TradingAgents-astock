@@ -1538,51 +1538,341 @@ def get_global_news(
 
 # ---- 9. get_insider_transactions ----
 
+_SHAREHOLDER_TRADE_FIELDS = [
+    "ts_code",
+    "ann_date",
+    "holder_name",
+    "holder_type",
+    "in_de",
+    "change_vol",
+    "change_ratio",
+    "after_share",
+    "after_ratio",
+    "begin_date",
+    "close_date",
+]
+
+_SHAREHOLDER_NUMBER_FIELDS = [
+    "ts_code",
+    "ann_date",
+    "end_date",
+    "holder_num",
+]
+
+_TOP10_HOLDER_FIELDS = [
+    "ts_code",
+    "ann_date",
+    "end_date",
+    "holder_name",
+    "hold_amount",
+    "hold_ratio",
+    "hold_float_ratio",
+]
+
+
+def _shareholder_contract_header(
+    *,
+    status: str,
+    symbol: str,
+    as_of: str,
+    trade_date: str,
+    coverage: str = "individual_stock",
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    notes: str = "",
+) -> str:
+    return _build_data_source_contract_header(
+        status=status,
+        source="Tushare stk_holdertrade + top10_holders + top10_floatholders + stk_holdernumber",
+        data_type="shareholder_f10",
+        query_target="stock",
+        symbol=symbol,
+        as_of=as_of,
+        trade_date=trade_date,
+        unit="shares; percent; holder_num households; other fields raw Tushare",
+        coverage=coverage,
+        fallback="none",
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+        limitations=(
+            "compatible function name retained; output is A-share shareholder/F10 "
+            "and holder-change data, not US-style insider transaction data"
+        ),
+        notes=notes,
+    )
+
+
+def _shareholder_short_message(
+    *,
+    status: str,
+    symbol: str,
+    as_of: str,
+    trade_date: str = "N/A",
+    coverage: str = "individual_stock",
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    message: str,
+) -> str:
+    header = _shareholder_contract_header(
+        status=status,
+        symbol=symbol,
+        as_of=as_of,
+        trade_date=trade_date,
+        coverage=coverage,
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+    )
+    return f"{header}\n\n{message}"
+
+
+def _shareholder_ts_code(ticker: str) -> tuple[str, bool]:
+    try:
+        code = _normalize_ticker(str(ticker))
+    except Exception:
+        return str(ticker or "N/A"), False
+    if not _re.fullmatch(r"\d{6}", code):
+        return code or "N/A", False
+    return _tushare_ts_code(code), True
+
+
+def _shareholder_date_window(as_of: str, days: int = 365) -> tuple[str, str, str]:
+    as_of_dt = pd.to_datetime(as_of).normalize()
+    start_date = (as_of_dt - pd.Timedelta(days=days)).strftime("%Y%m%d")
+    end_date = as_of_dt.strftime("%Y%m%d")
+    return as_of_dt.strftime("%Y-%m-%d"), start_date, end_date
+
+
+def _shareholder_frame(data: object, fields: list[str], ts_code: str) -> pd.DataFrame:
+    df = _tushare_data_to_frame(data)
+    if df.empty:
+        return df
+    if "ts_code" not in df.columns:
+        raise ValueError("unexpected_schema: shareholder data missing ts_code")
+
+    df = df.copy()
+    df["ts_code"] = df["ts_code"].astype(str).str.upper()
+    df = df[df["ts_code"] == ts_code.upper()]
+    if df.empty:
+        return df
+
+    available_columns = [field for field in fields if field in df.columns]
+    return df[available_columns].reset_index(drop=True)
+
+
+def _latest_report_rows(df: pd.DataFrame, date_field: str, limit: int) -> pd.DataFrame:
+    if df.empty or date_field not in df.columns:
+        return df.head(limit).reset_index(drop=True)
+    df = df.copy()
+    df[date_field] = df[date_field].astype(str).str.replace("-", "", regex=False)
+    valid = df[df[date_field].str.len().eq(8)]
+    if valid.empty:
+        return df.head(limit).reset_index(drop=True)
+    latest = valid[date_field].max()
+    latest_rows = valid[valid[date_field] == latest]
+    return latest_rows.head(limit).reset_index(drop=True)
+
+
+def _recent_rows(df: pd.DataFrame, date_field: str, limit: int) -> pd.DataFrame:
+    if df.empty or date_field not in df.columns:
+        return df.head(limit).reset_index(drop=True)
+    df = df.copy()
+    df[date_field] = df[date_field].astype(str).str.replace("-", "", regex=False)
+    return df.sort_values(date_field, ascending=False).head(limit).reset_index(drop=True)
+
+
+def _shareholder_markdown_table(df: pd.DataFrame, columns: list[str]) -> str:
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for _, row in df.iterrows():
+        values: list[str] = []
+        for column in columns:
+            value = row.get(column, "")
+            if pd.isna(value):
+                values.append("")
+            elif isinstance(value, float):
+                values.append(f"{value:.2f}")
+            else:
+                text = str(value).replace("\n", " ").replace("|", "/")
+                if len(text) > 180:
+                    text = text[:177] + "..."
+                values.append(text)
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
+def _format_shareholder_output(
+    *,
+    status: str,
+    ts_code: str,
+    as_of: str,
+    start_date: str,
+    end_date: str,
+    sections: list[tuple[str, pd.DataFrame, list[str]]],
+    error_apis: list[str],
+) -> str:
+    date_values: list[str] = []
+    for _, df, _ in sections:
+        for column in ("ann_date", "end_date", "close_date"):
+            if column in df.columns:
+                date_values.extend(df[column].dropna().astype(str).tolist())
+    trade_date = max([value.replace("-", "") for value in date_values if len(value.replace("-", "")) == 8], default="N/A")
+    notes = f"query_window={start_date}-{end_date}; sections={len(sections)}"
+    if error_apis:
+        notes += f"; unavailable_apis={','.join(error_apis)}"
+    header = _shareholder_contract_header(
+        status=status,
+        symbol=ts_code,
+        as_of=as_of,
+        trade_date=trade_date,
+        notes=notes,
+    )
+    lines = ["# A-share Shareholder / F10 Data", ""]
+    for title, df, fields in sections:
+        columns = [field for field in fields if field in df.columns]
+        lines.extend([
+            f"## {title}",
+            "",
+            _shareholder_markdown_table(df, columns),
+            "",
+        ])
+    return f"{header}\n\n" + "\n".join(lines).rstrip()
+
 
 def get_insider_transactions(
     ticker: Annotated[str, "A-stock code"],
 ) -> str:
-    """Get shareholder/insider activity via mootdx F10.
-
-    Note: A-stock insider transaction data differs from US markets.
-    Uses mootdx F10 shareholder research as the closest equivalent.
-    """
-    code = _normalize_ticker(ticker)
-
-    try:
-        client = _get_mootdx_client()
-        text = client.F10(symbol=code, name="股东研究")
-
-        if not text or not text.strip():
-            return f"No insider/shareholder data found for A-stock '{code}'"
-
-        header = f"# Shareholder Research for {code} (A-stock)\n"
-        header += "# Note: A-stock equivalent of insider transactions\n"
-        header += "# Data source: mootdx F10\n"
-        header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    """Get A-share shareholder/F10 data via Tushare shareholder APIs."""
+    as_of_input = datetime.now().strftime("%Y-%m-%d")
+    ts_code, valid_symbol = _shareholder_ts_code(ticker)
+    if not valid_symbol:
+        return _shareholder_short_message(
+            status="invalid_input",
+            symbol=ts_code,
+            as_of=as_of_input,
+            coverage="symbol_unresolved",
+            empty_reason="invalid_or_unresolved_ticker",
+            message="Invalid or unresolved A-share ticker for shareholder/F10 query.",
         )
 
-        import re
+    try:
+        as_of, start_date, end_date = _shareholder_date_window(as_of_input)
+    except Exception:
+        return _shareholder_short_message(
+            status="invalid_input",
+            symbol=ts_code,
+            as_of=as_of_input,
+            empty_reason="not_applicable",
+            message="Invalid date input for shareholder/F10 query.",
+        )
 
-        sec4_hits = list(re.finditer(r"\r?\n【4\.股东变化】\r?\n", text))
-        if sec4_hits:
-            sec4_pos = sec4_hits[-1].start()
-            before_sec4 = text[:sec4_pos]
-            sec4_text = text[sec4_pos:]
-            cut_at = 2000
-            if len(sec4_text) > cut_at:
-                sec4_text = (
-                    sec4_text[:cut_at]
-                    + "\n\n(... older shareholder history omitted, "
-                    f"{len(text) - sec4_pos - cut_at} chars truncated ...)"
-                )
-            text = before_sec4 + sec4_text
+    try:
+        from .tushare_client import get_tushare_client
 
-        return header + text
+        client = get_tushare_client()
+        sections: list[tuple[str, pd.DataFrame, list[str]]] = []
+        error_apis: list[str] = []
+        api_errors: list[str] = []
 
-    except Exception as e:
-        return f"Error retrieving insider/shareholder data for {code}: {str(e)}"
+        api_specs = [
+            (
+                "stk_holdertrade",
+                {"ts_code": ts_code, "start_date": start_date, "end_date": end_date},
+                _SHAREHOLDER_TRADE_FIELDS,
+                "Important Shareholder Increase / Decrease Records",
+                lambda df: _recent_rows(df, "ann_date", 10),
+            ),
+            (
+                "stk_holdernumber",
+                {"ts_code": ts_code, "start_date": start_date, "end_date": end_date},
+                _SHAREHOLDER_NUMBER_FIELDS,
+                "Shareholder Count",
+                lambda df: _recent_rows(df, "end_date", 8),
+            ),
+            (
+                "top10_holders",
+                {"ts_code": ts_code},
+                _TOP10_HOLDER_FIELDS,
+                "Top 10 Shareholders",
+                lambda df: _latest_report_rows(df, "end_date", 10),
+            ),
+            (
+                "top10_floatholders",
+                {"ts_code": ts_code},
+                _TOP10_HOLDER_FIELDS,
+                "Top 10 Floating Shareholders",
+                lambda df: _latest_report_rows(df, "end_date", 10),
+            ),
+        ]
+
+        for api_name, params, fields, title, reducer in api_specs:
+            response = client.call_api(
+                api_name,
+                params=params,
+                fields=",".join(fields),
+                cache_key=f"{api_name}/{ts_code}.json",
+                use_cache=False,
+            )
+            if not response.ok:
+                error_apis.append(api_name)
+                api_errors.append(response.error or response.message or "")
+                continue
+
+            df = _shareholder_frame(response.data, fields, ts_code)
+            if not df.empty:
+                reduced = reducer(df)
+                if not reduced.empty:
+                    sections.append((title, reduced, fields))
+
+        if sections:
+            status = "partial_data" if error_apis else "ok"
+            return _format_shareholder_output(
+                status=status,
+                ts_code=ts_code,
+                as_of=as_of,
+                start_date=start_date,
+                end_date=end_date,
+                sections=sections,
+                error_apis=error_apis,
+            )
+
+        if error_apis:
+            error_type = _classify_data_source_error(api_errors[0] if api_errors else "")
+            return _shareholder_short_message(
+                status="technical_error",
+                symbol=ts_code,
+                as_of=as_of,
+                error_type=error_type,
+                raw_error_suppressed=True,
+                message="Data source request failed; raw technical details suppressed.",
+            )
+
+        return _shareholder_short_message(
+            status="empty",
+            symbol=ts_code,
+            as_of=as_of,
+            empty_reason="no_coverage",
+            message=(
+                "Tushare shareholder APIs returned no shareholder/F10 rows for "
+                "the requested stock."
+            ),
+        )
+
+    except Exception as exc:
+        error_type = _classify_data_source_error(exc)
+        return _shareholder_short_message(
+            status="technical_error",
+            symbol=ts_code,
+            as_of=as_of_input,
+            error_type=error_type,
+            raw_error_suppressed=True,
+            message="Data source request failed; raw technical details suppressed.",
+        )
 
 
 # ---- 10. get_profit_forecast ----
