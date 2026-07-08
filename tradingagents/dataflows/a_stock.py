@@ -1280,6 +1280,8 @@ def get_income_statement(
 
 # ---- 7. get_news ----
 
+_STOCK_NEWS_FIELDS = ["pub_time", "source", "title", "summary", "url"]
+
 
 def _fetch_news_eastmoney(code: str, page_size: int = 20) -> list[dict]:
     """Direct East Money search API for individual stock news."""
@@ -1370,70 +1372,272 @@ def _fetch_news_sina(code: str, page_size: int = 20) -> list[dict]:
     return articles
 
 
-def get_news(
-    ticker: Annotated[str, "A-stock code"],
-    start_date: Annotated[str, "Start date yyyy-mm-dd"],
-    end_date: Annotated[str, "End date yyyy-mm-dd"],
+def _stock_news_contract_header(
+    *,
+    status: str,
+    symbol: str,
+    as_of: str,
+    trade_date: str,
+    coverage: str = "individual_stock",
+    fallback: str = "none",
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    notes: str = "",
 ) -> str:
-    """Get stock-specific news via East Money direct API (Sina as fallback)."""
-    code = _normalize_ticker(ticker)
+    return _build_data_source_contract_header(
+        status=status,
+        source="Eastmoney stock news + Sina fallback",
+        data_type="news",
+        query_target="stock",
+        symbol=symbol,
+        as_of=as_of,
+        trade_date=trade_date,
+        unit="news_items",
+        coverage=coverage,
+        fallback=fallback,
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+        limitations="stock-specific news only; no market-wide, macro, or filing feed used",
+        notes=notes,
+    )
 
+
+def _stock_news_short_message(
+    *,
+    status: str,
+    symbol: str,
+    as_of: str,
+    trade_date: str = "N/A",
+    coverage: str = "individual_stock",
+    fallback: str = "none",
+    empty_reason: str = "none",
+    error_type: str = "none",
+    raw_error_suppressed: bool = False,
+    message: str,
+) -> str:
+    header = _stock_news_contract_header(
+        status=status,
+        symbol=symbol,
+        as_of=as_of,
+        trade_date=trade_date,
+        coverage=coverage,
+        fallback=fallback,
+        empty_reason=empty_reason,
+        error_type=error_type,
+        raw_error_suppressed=raw_error_suppressed,
+    )
+    return f"{header}\n\n{message}"
+
+
+def _stock_news_code(ticker: str) -> tuple[str, bool]:
+    try:
+        code = _normalize_ticker(str(ticker))
+    except Exception:
+        return str(ticker or "N/A"), False
+    if not _re.fullmatch(r"\d{6}", code):
+        return code or "N/A", False
+    return code, True
+
+
+def _stock_news_window(start_date: str, end_date: str) -> tuple[str, datetime, datetime]:
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    if start_dt > end_dt:
+        raise ValueError("start_date after end_date")
+    return end_dt.strftime("%Y-%m-%d"), start_dt, end_dt
 
-    articles: list[dict] = []
-    source_label = ""
 
+def _stock_news_fetch_source(
+    source: str,
+    code: str,
+    limit: int,
+) -> tuple[list[dict], str]:
     try:
-        articles = _fetch_news_eastmoney(code)
-        source_label = "东方财富"
-    except Exception as e:
-        logger.warning("East Money news fetch failed for %s: %s", code, e)
+        if source == "eastmoney":
+            return _fetch_news_eastmoney(code, page_size=limit), ""
+        if source == "sina":
+            return _fetch_news_sina(code, page_size=limit), ""
+    except Exception as exc:
+        return [], _classify_data_source_error(exc)
+    return [], "unknown"
 
-    if not articles:
-        try:
-            articles = _fetch_news_sina(code)
-            source_label = "新浪财经"
-        except Exception as e:
-            logger.warning("Sina news fetch failed for %s: %s", code, e)
 
-    if not articles:
-        return f"No news found for A-stock '{code}'"
-
-    news_str = ""
-    count = 0
-    for art in articles:
-        pub_time = art.get("time", "")
+def _filter_stock_news_by_date(
+    articles: list[dict],
+    start_dt: datetime,
+    end_dt: datetime,
+) -> list[dict]:
+    filtered: list[dict] = []
+    for article in articles:
+        pub_time = str(article.get("time", "") or "")
         try:
             pub_dt = datetime.strptime(pub_time[:10], "%Y-%m-%d")
             if pub_dt < start_dt or pub_dt > end_dt:
                 continue
         except (ValueError, IndexError):
             pass
+        filtered.append(article)
+    return filtered
 
-        title = art["title"]
-        content = art.get("content", "")
-        source = art.get("source", source_label)
-        link = art.get("url", "")
 
-        news_str += f"### {title} (source: {source})\n"
-        if content:
-            snippet = content[:300] + "..." if len(content) > 300 else content
-            news_str += f"{snippet}\n"
-        if link and link != "nan":
-            news_str += f"Link: {link}\n"
-        news_str += "\n"
-        count += 1
+def _dedupe_stock_news(articles: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for article in articles:
+        title = str(article.get("title", "") or "").strip()
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        unique.append(article)
+    return unique
 
-    if count == 0:
-        return (
-            f"No news found for A-stock '{code}' "
-            f"between {start_date} and {end_date}"
+
+def _stock_news_markdown_table(articles: list[dict]) -> str:
+    lines = [
+        "| " + " | ".join(_STOCK_NEWS_FIELDS) + " |",
+        "| " + " | ".join("---" for _ in _STOCK_NEWS_FIELDS) + " |",
+    ]
+    for article in articles:
+        values: list[str] = []
+        for field in _STOCK_NEWS_FIELDS:
+            source_key = "time" if field == "pub_time" else "content" if field == "summary" else field
+            text = str(article.get(source_key, "") or "").replace("\n", " ").replace("|", "/")
+            if len(text) > 220:
+                text = text[:217] + "..."
+            values.append(text)
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
+def _format_stock_news_output(
+    *,
+    status: str,
+    code: str,
+    as_of: str,
+    start_date: str,
+    end_date: str,
+    articles: list[dict],
+    fallback: str,
+    raw_error_suppressed: bool,
+    notes: str,
+) -> str:
+    pub_dates = [
+        str(article.get("time", ""))[:10]
+        for article in articles
+        if str(article.get("time", ""))[:10]
+    ]
+    trade_date = max(pub_dates) if pub_dates else "N/A"
+    header = _stock_news_contract_header(
+        status=status,
+        symbol=code,
+        as_of=as_of,
+        trade_date=trade_date,
+        fallback=fallback,
+        raw_error_suppressed=raw_error_suppressed,
+        notes=f"query_window={start_date}-{end_date}; rows={len(articles)}; {notes}".rstrip("; "),
+    )
+    lines = [
+        f"# Stock-Specific News for {code}",
+        "",
+        _stock_news_markdown_table(articles),
+    ]
+    return f"{header}\n\n" + "\n".join(lines)
+
+
+def get_news(
+    ticker: Annotated[str, "A-stock code"],
+    start_date: Annotated[str, "Start date yyyy-mm-dd"],
+    end_date: Annotated[str, "End date yyyy-mm-dd"],
+) -> str:
+    """Get stock-specific news via East Money direct API (Sina as fallback)."""
+    code, valid_symbol = _stock_news_code(ticker)
+    if not valid_symbol:
+        return _stock_news_short_message(
+            status="invalid_input",
+            symbol=code,
+            as_of=str(end_date),
+            coverage="symbol_unresolved",
+            empty_reason="invalid_or_unresolved_ticker",
+            message="Invalid or unresolved A-share ticker for stock news query.",
         )
 
-    return (
-        f"## {code} (A-stock) News, from {start_date} to {end_date}:\n\n"
-        + news_str
+    try:
+        as_of, start_dt, end_dt = _stock_news_window(start_date, end_date)
+    except Exception:
+        return _stock_news_short_message(
+            status="invalid_input",
+            symbol=code,
+            as_of=str(end_date),
+            empty_reason="not_applicable",
+            message="Invalid date window for stock news query.",
+        )
+
+    eastmoney_articles, eastmoney_error = _stock_news_fetch_source(
+        "eastmoney", code, 20
+    )
+    eastmoney_filtered = _dedupe_stock_news(
+        _filter_stock_news_by_date(eastmoney_articles, start_dt, end_dt)
+    )
+    if eastmoney_filtered:
+        return _format_stock_news_output(
+            status="ok",
+            code=code,
+            as_of=as_of,
+            start_date=start_date,
+            end_date=end_date,
+            articles=eastmoney_filtered,
+            fallback="none",
+            raw_error_suppressed=False,
+            notes="source_used=Eastmoney",
+        )
+
+    sina_articles, sina_error = _stock_news_fetch_source("sina", code, 20)
+    sina_filtered = _dedupe_stock_news(
+        _filter_stock_news_by_date(sina_articles, start_dt, end_dt)
+    )
+    if sina_filtered:
+        fallback_reason = "Eastmoney unavailable" if eastmoney_error else "Eastmoney empty_or_filtered"
+        return _format_stock_news_output(
+            status="partial_data",
+            code=code,
+            as_of=as_of,
+            start_date=start_date,
+            end_date=end_date,
+            articles=sina_filtered,
+            fallback="Eastmoney->Sina",
+            raw_error_suppressed=bool(eastmoney_error),
+            notes=f"{fallback_reason}; source_used=Sina",
+        )
+
+    if eastmoney_error and sina_error:
+        error_type = (
+            eastmoney_error
+            if eastmoney_error == sina_error
+            else "mixed_source_error"
+        )
+        return _stock_news_short_message(
+            status="technical_error",
+            symbol=code,
+            as_of=as_of,
+            fallback="Eastmoney->Sina",
+            error_type=error_type,
+            raw_error_suppressed=True,
+            message="Data source request failed; raw technical details suppressed.",
+        )
+
+    empty_reason = "filtered_out" if eastmoney_articles or sina_articles else "source_empty"
+    return _stock_news_short_message(
+        status="empty",
+        symbol=code,
+        as_of=as_of,
+        fallback="Eastmoney->Sina",
+        empty_reason=empty_reason,
+        message=(
+            "Stock-specific news sources returned no rows for the requested "
+            "stock and date window."
+        ),
     )
 
 
