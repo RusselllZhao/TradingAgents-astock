@@ -18,6 +18,7 @@ from tradingagents.llm_clients import create_llm_client
 from tradingagents.agents import *
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.agents.utils.report_terms import normalize_chinese_report_state
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.agents.utils.agent_states import (
     AgentState,
@@ -368,6 +369,9 @@ class TradingAgentsGraph:
 
     def finalize_graph_run(self, company_name, trade_date, final_state):
         """Persist a completed run and clear its checkpoint."""
+        if self._uses_chinese_output():
+            final_state = normalize_chinese_report_state(final_state)
+
         self.curr_state = final_state
 
         # Log state to disk.
@@ -387,6 +391,10 @@ class TradingAgentsGraph:
             )
 
         return self.process_signal(final_state["final_trade_decision"])
+
+    def _uses_chinese_output(self) -> bool:
+        output_language = str(self.config.get("output_language", "")).strip().lower()
+        return output_language in {"chinese", "zh", "zh-cn", "zh_cn", "中文"}
 
     def close_graph_run(self) -> None:
         """Close the active checkpointer context, if any."""
