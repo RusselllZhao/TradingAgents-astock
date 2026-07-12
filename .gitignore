@@ -220,6 +220,12 @@ __marimo__/
 **/data_cache/
 .cache/tushare/
 
+# Local runtime artifacts
+logs/
+runtime_logs/
+output/
+outputs/
+
 # Local credentials
 config/local_tushare.toml
 
