@@ -84,7 +84,7 @@ Final remotes:
 
 ```text
 origin   https://github.com/RusselllZhao/TradingAgents-astock.git
-upstream https://github.com/simonlin1212/TradingAgents-astock
+upstream https://github.com/simonlin1212/TradingAgents-astock.git
 ```
 
 Both remote `main` and the retained recovery branch initially resolved to `bdd9a14dfdd920567a00b597e086b91eb8db72a2`. The annotated baseline tag peels to the same commit. This migration result and handoff documentation are committed afterward on canonical `main`.
